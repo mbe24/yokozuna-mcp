@@ -1,0 +1,77 @@
+{
+  "name": "yokozuna-mcp",
+  "version": "0.1.0",
+  "description": "MCP server (stdio) wrapping the Sumo Logic Search Job API for agent-driven log triage",
+  "type": "module",
+  "license": "Apache-2.0",
+  "author": "Mikael Beyene",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mbe24/yokozuna-mcp"
+  },
+  "homepage": "https://github.com/mbe24/yokozuna-mcp#readme",
+  "bugs": {
+    "url": "https://github.com/mbe24/yokozuna-mcp/issues"
+  },
+  "funding": [
+    "https://github.com/sponsors/mbe24",
+    "https://ko-fi.com/mbe24"
+  ],
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "mcp-server",
+    "sumo-logic",
+    "sumologic",
+    "logs",
+    "logging",
+    "observability",
+    "log-triage",
+    "search-job-api",
+    "claude",
+    "ai-agents"
+  ],
+  "bin": {
+    "yokozuna-mcp": "dist/index.js"
+  },
+  "main": "dist/index.js",
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "dev": "tsx watch src/index.ts",
+    "start": "node dist/index.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:integration": "vitest run --config vitest.integration.config.ts",
+    "lint": "eslint src test",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "format": "prettier --write \"src/**/*.ts\" \"test/**/*.ts\"",
+    "format:check": "prettier --check \"src/**/*.ts\" \"test/**/*.ts\"",
+    "assets": "node scripts/render-assets.mjs",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@resvg/resvg-js": "^2.6.2",
+    "@types/node": "^22.18.0",
+    "eslint": "^9.39.0",
+    "prettier": "^3.9.4",
+    "tsx": "^4.22.5",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.62.1",
+    "vitest": "^4.1.9"
+  }
+}
