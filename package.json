@@ -1,13 +1,13 @@
 {
   "name": "yokozuna-mcp",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "MCP server (stdio) wrapping the Sumo Logic Search Job API for agent-driven log triage",
   "type": "module",
   "license": "Apache-2.0",
   "author": "Mikael Beyene",
   "repository": {
     "type": "git",
-    "url": "https://github.com/mbe24/yokozuna-mcp"
+    "url": "git+https://github.com/mbe24/yokozuna-mcp.git"
   },
   "homepage": "https://github.com/mbe24/yokozuna-mcp#readme",
   "bugs": {

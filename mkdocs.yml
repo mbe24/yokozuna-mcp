@@ -1,0 +1,24 @@
+site_name: yokozuna-mcp
+site_description: MCP server wrapping the Sumo Logic Search Job API for agent-driven log triage
+site_url: https://yokozuna-mcp.readthedocs.io/
+repo_url: https://github.com/mbe24/yokozuna-mcp
+repo_name: mbe24/yokozuna-mcp
+edit_uri: edit/main/docs/
+docs_dir: docs
+strict: true
+
+theme:
+  name: material
+
+markdown_extensions:
+  - admonition
+
+nav:
+  - Home: index.md
+  - Installation: installation.md
+  - Tools reference: tools.md
+  - Querying & schema-learning: querying.md
+  - Monitoring: monitoring.md
+  - Configuration: configuration.md
+  - Troubleshooting: troubleshooting.md
+  - Development: development.md

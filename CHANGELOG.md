@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.2.2 — documentation site + CI/release automation
+
+No behavior changes to the server or tools. This is the first published release since
+0.2.0 — it also ships the 0.2.1 correctness fixes below (0.2.1 was never published).
+
+### Added
+
+- **Documentation site** (mkdocs Material → ReadTheDocs at
+  <https://yokozuna-mcp.readthedocs.io/>): Installation, Tools reference, Querying &
+  schema-learning, Monitoring, Configuration (full env-var table), Troubleshooting, and
+  Development pages — the in-depth content formerly packed into the README.
+- **CI workflow** (`.github/workflows/ci.yml`): typecheck → lint → build → unit tests on
+  every pull request and push to `main` (Node 20, ubuntu).
+- **Release workflow** (`.github/workflows/release.yml`), triggered by `v*` tag pushes:
+  verifies the tag matches `package.json`, **waits for the tagged commit's CI run** to
+  appear and conclude (commit + tag can be pushed back-to-back), and runs
+  `npm publish --provenance` to the public registry only on green — failed, missing,
+  or timed-out CI fails the release with no publish.
+
+### Changed
+
+- **README slimmed** to badges (CI · Docs · npm · License), npm-based installation
+  (Claude Code one-liner and Codex `~/.codex/config.toml` block via `npx -y
+  yokozuna-mcp`), the install-relevant env vars, and a pointer to the full docs.
+- `package.json` `repository.url` normalized to the canonical
+  `git+https://github.com/mbe24/yokozuna-mcp.git` form (npm provenance validates it
+  against the publishing repo).
+
 ## 0.2.1 — correctness patch
 
 Five confirmed misleading-output fixes plus a describe→digest handoff line. No config
