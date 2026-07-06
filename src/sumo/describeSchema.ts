@@ -545,6 +545,9 @@ export function renderDescription(args: {
       lines.push(`  ${i + 1}. ${c.fragment}`);
       lines.push(`     basis: ${c.rationale}`);
       for (const cv of c.caveats) lines.push(`     caveat: ${cv}`);
+      // §0.2.1 (c): copy-paste handoff — fragments come from the shared buildPredicate,
+      // so this line is exactly what the digest would apply. Output-only; no state.
+      lines.push(`     next: sumo_error_digest query="${args.scope}" filter='${c.fragment}'`);
     });
   }
   lines.push('');

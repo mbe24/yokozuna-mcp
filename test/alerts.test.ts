@@ -1,9 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import {
   ALERTS_INDEX_SCOPE,
+  collapseDuplicateAlerts,
   correlateAlertEvents,
+  filterAlertsByStatus,
   parseAlertEvent,
   renderAlerts,
+  type FiredAlert,
 } from '../src/sumo/alerts.js';
 
 const eventRaw = (over: {
@@ -113,5 +116,77 @@ describe('renderAlerts', () => {
 
   it('the index scope constant is the documented one with _index leading', () => {
     expect(ALERTS_INDEX_SCOPE).toBe('_index=sumologic_system_events _sourceCategory=alerts');
+  });
+});
+
+const firedAlert = (over: Partial<FiredAlert>): FiredAlert => ({
+  monitorId: 'M1',
+  firedAtMs: 1_000_000,
+  lastStatus: 'Normal',
+  statesSeen: ['Critical', 'Normal'],
+  events: 2,
+  instances: 1,
+  ...over,
+});
+
+describe('filterAlertsByStatus (§0.2.1 #1 — latest vs ever)', () => {
+  const resolvedCritical = firedAlert({ lastStatus: 'Normal', statesSeen: ['Critical', 'Normal'] });
+  const openCritical = firedAlert({ monitorId: 'M2', lastStatus: 'Critical', statesSeen: ['Critical'] });
+
+  it('"latest" matches the current state only — a resolved Critical (now Normal) is excluded', () => {
+    const out = filterAlertsByStatus([resolvedCritical, openCritical], ['Critical'], 'latest');
+    expect(out).toHaveLength(1);
+    expect(out[0]!.monitorId).toBe('M2');
+  });
+
+  it('"ever" restores lifetime behavior — the resolved Critical matches again', () => {
+    const out = filterAlertsByStatus([resolvedCritical, openCritical], ['Critical'], 'ever');
+    expect(out).toHaveLength(2);
+  });
+
+  it('is case-insensitive', () => {
+    expect(filterAlertsByStatus([openCritical], ['critical'], 'latest')).toHaveLength(1);
+  });
+});
+
+describe('collapseDuplicateAlerts (§0.2.1 #3)', () => {
+  it('collapses same-monitor instances fired within the window into one ×N row', () => {
+    const alerts: FiredAlert[] = [
+      firedAlert({ monitorId: 'M1', firedAtMs: 1_000_000, resolvedAtMs: 1_030_000, lastStatus: 'Normal' }),
+      firedAlert({ monitorId: 'M1', firedAtMs: 1_000_003, resolvedAtMs: 1_090_000, lastStatus: 'Normal' }),
+      firedAlert({ monitorId: 'M1', firedAtMs: 1_000_004, resolvedAtMs: undefined, lastStatus: 'Critical' }),
+    ];
+    const out = collapseDuplicateAlerts(alerts);
+    expect(out).toHaveLength(1);
+    expect(out[0]!.instances).toBe(3);
+    expect(out[0]!.firedAtMs).toBe(1_000_000); // earliest
+    expect(out[0]!.resolvedAtMs).toBeUndefined(); // one instance still open
+    expect(out[0]!.events).toBe(6);
+  });
+
+  it('does NOT collapse instances fired more than the window apart', () => {
+    const out = collapseDuplicateAlerts([
+      firedAlert({ monitorId: 'M1', firedAtMs: 1_000_000 }),
+      firedAlert({ monitorId: 'M1', firedAtMs: 1_000_000 + 6_000 }),
+    ]);
+    expect(out).toHaveLength(2);
+    expect(out.every((a) => a.instances === 1)).toBe(true);
+  });
+
+  it('never collapses across different monitors', () => {
+    const out = collapseDuplicateAlerts([
+      firedAlert({ monitorId: 'M1', firedAtMs: 1_000_000 }),
+      firedAlert({ monitorId: 'M2', firedAtMs: 1_000_001 }),
+    ]);
+    expect(out).toHaveLength(2);
+  });
+
+  it('renderAlerts shows the ×N instances annotation and the status-scope label', () => {
+    const out = renderAlerts(
+      [firedAlert({ monitorId: 'M1', firedAtMs: 1_000_000, resolvedAtMs: undefined, lastStatus: 'Critical', instances: 4 })],
+      { rangeLabel: 'a .. b', scannedEvents: 8, limit: 50, statusFilter: ['Critical'], statusScope: 'latest' },
+    );
+    expect(out).toContain('×4 instances');
+    expect(out).toContain('latest state');
   });
 });

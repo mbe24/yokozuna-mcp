@@ -87,3 +87,27 @@ describe('buildExtractClauses', () => {
     expect(() => buildExtractClauses({ ok: '  ' })).toThrow(/non-empty/);
   });
 });
+
+describe('ExtractFillCounter (§0.2.1 #5)', () => {
+  it('warns only for aliases that are all-empty across observed rows', async () => {
+    const { ExtractFillCounter } = await import('../src/sumo/queryShape.js');
+    const c = new ExtractFillCounter(['st', 'user']);
+    c.observe({ st: '', user: 'alice' });
+    c.observe({ st: '', user: 'bob' });
+    c.observe({ user: 'carol' }); // st absent → still empty
+    const warns = c.warnings();
+    expect(warns).toHaveLength(1);
+    expect(warns[0]).toBe(
+      'extract "st": 0/3 non-empty — the path may not exist on these rows; run sumo_describe_schema.',
+    );
+  });
+
+  it('a single non-empty value suppresses the warning; no rows → no warnings', async () => {
+    const { ExtractFillCounter } = await import('../src/sumo/queryShape.js');
+    const c = new ExtractFillCounter(['st']);
+    expect(c.warnings()).toEqual([]); // nothing observed
+    c.observe({ st: '' });
+    c.observe({ st: '200' });
+    expect(c.warnings()).toEqual([]);
+  });
+});

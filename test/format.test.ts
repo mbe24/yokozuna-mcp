@@ -493,6 +493,43 @@ describe('renderFacets annotations (§10.3, §11.1)', () => {
     expect(out).not.toContain('404.0');
     expect(out).not.toContain('may not exist');
   });
+
+  it('merges int/float forms of a numeric key, sums counts, annotates the merged row (§0.2.1 #4)', () => {
+    const out = renderFacets(header, [
+      {
+        dimension: 'log.severity',
+        rows: [
+          { key: '2', count: 30 },
+          { key: '2.0', count: 12 },
+          { key: '3', count: 5 },
+        ],
+      },
+    ]);
+    // 2 (30) + 2.0 (12) = 42, re-sorted above 3.
+    expect(out).toContain('42  2  (int+float forms)');
+    expect(out).not.toMatch(/^\s*\d+\s+2\.0/m); // no separate 2.0 row
+    // A key present in only one form is not annotated.
+    expect(out).toContain('5  3');
+    expect(out).not.toContain('5  3  (int+float forms)');
+  });
+});
+
+describe('mergeNumericFacetRows (§0.2.1 #4)', () => {
+  it('leaves distinct keys untouched and never merges (none) with a numeric key', async () => {
+    const { mergeNumericFacetRows } = await import('../src/format/renderFacets.js');
+    const merged = mergeNumericFacetRows([
+      { key: '', count: 4 },
+      { key: '5', count: 1 },
+      { key: '5.0', count: 9 },
+    ]);
+    expect(merged).toHaveLength(2);
+    const five = merged.find((r) => r.key === '5')!;
+    expect(five.count).toBe(10);
+    expect(five.mergedForms).toBe(true);
+    const none = merged.find((r) => r.key === '')!;
+    expect(none.count).toBe(4);
+    expect(none.mergedForms).toBeUndefined();
+  });
 });
 
 describe('dedupe + detail:"raw" keeps one exemplar (§11.3)', () => {

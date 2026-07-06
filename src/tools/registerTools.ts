@@ -9,7 +9,13 @@ import { SumoApiError } from '../http/errors.js';
 import type { SearchJobApi } from '../sumo/searchJobApi.js';
 import { collectMessages, waitForCompletion, type KeepaliveRegistry } from '../sumo/lifecycle.js';
 import { parseLast, pickTrendInterval, resolveRange } from '../sumo/time.js';
-import { buildExtractClauses, isAggregateQuery } from '../sumo/queryShape.js';
+import { buildExtractClauses, ExtractFillCounter, isAggregateQuery } from '../sumo/queryShape.js';
+import {
+  buildSiblingProbeQuery,
+  buildUnderScopeNote,
+  exactSourceCategoryTerm,
+  type ExactCategoryTerm,
+} from '../sumo/underScope.js';
 import { buildDeepLink } from '../sumo/deepLink.js';
 import type { MonitorsApi, MonitorSearchHit } from '../sumo/monitorsApi.js';
 import { MAX_PAGE_LIMIT, MAX_TOTAL_MESSAGES, type SearchJobStatus } from '../sumo/types.js';
@@ -24,7 +30,9 @@ import {
 import { describeSchema } from '../sumo/describeSchema.js';
 import {
   ALERTS_INDEX_SCOPE,
+  collapseDuplicateAlerts,
   correlateAlertEvents,
+  filterAlertsByStatus,
   parseAlertEvent,
   renderAlerts,
   type AlertEvent,
@@ -376,6 +384,47 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     }
   };
 
+  /**
+   * §0.2.1 #2: the calm-clean under-scope probe. Runs ONE volume-only `count by
+   * _sourcecategory` over the exact category's `<X>*` prefix and returns the coverage
+   * note, or undefined (no meaningful siblings / probe failed — never blocks the digest).
+   */
+  const siblingCoverageNote = async (
+    input: { timeZone?: string; byReceiptTime?: boolean },
+    base: string,
+    exact: ExactCategoryTerm,
+    exactCount: number,
+    range: { from: string | number; to: string | number },
+    signal?: AbortSignal,
+  ): Promise<string | undefined> => {
+    let probeId: string | undefined;
+    try {
+      const created = await api.create(
+        {
+          query: buildSiblingProbeQuery(base, exact),
+          from: range.from,
+          to: range.to,
+          timeZone: input.timeZone ?? config.defaultTimeZone,
+          byReceiptTime: input.byReceiptTime,
+        },
+        signal,
+      );
+      probeId = created.id;
+      const wait = await waitForCompletion(api, probeId, { timeoutMs: 60_000, signal });
+      if (wait.partial) return undefined;
+      const page = await api.records(probeId, 0, 100, signal);
+      const rows = (page.records ?? []).map((r) => ({
+        category: r.map['_sourcecategory'] ?? '',
+        count: Number.parseInt(r.map['_count'] ?? '0', 10) || 0,
+      }));
+      return buildUnderScopeNote(exact.category, rows, exactCount);
+    } catch {
+      return undefined;
+    } finally {
+      if (probeId) await api.delete(probeId, { tolerateMissing: true }).catch(() => undefined);
+    }
+  };
+
   // ---------------------------------------------------------------- sumo_run_search
   server.registerTool(
     'sumo_run_search',
@@ -407,6 +456,8 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
           );
         }
         const effectiveQuery = `${input.query}${buildExtractClauses(input.extract)}`;
+        const extractAliases = Object.keys(input.extract ?? {});
+        const fillCounter = extractAliases.length > 0 ? new ExtractFillCounter(extractAliases) : undefined;
         const { created, range } = await createJob({ ...input, query: effectiveQuery }, extra.signal);
         jobId = created.id;
 
@@ -440,6 +491,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
           try {
             const page = await api.messages(jobId, 0, limit, extra.signal);
             const rows = sortRowsByMessageTime(page.messages ?? [], input.sort ?? 'asc');
+            if (fillCounter) for (const r of rows) fillCounter.observe(r.map);
             const opts = fmtOpts(input);
             if (opts.detail === 'summary') {
               const exact = exactLevelCountsPromise ? await exactLevelCountsPromise : undefined;
@@ -469,6 +521,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
         if (wait.truncated) notes.push('TRUNCATED: query hit the 100k message cap (FORCE PAUSED) — narrow the time range for full coverage.');
         if (wait.partial) notes.push('PARTIAL: wait timed out before completion — results are what was gathered so far.');
         if (warns.length > 0) notes.push(`warnings: ${warns.join(' | ')}`);
+        if (fillCounter) notes.push(...fillCounter.warnings());
         if (link) notes.push(`open in Sumo UI: ${link}`);
         if (input.keepJob) notes.push(`job kept alive: id=${jobId} (auto-polled by the server; idle jobs are auto-deleted after ~${idleDoc}, any access resets the timer; delete with sumo_delete_search_job)`);
         if (kind === 'messages' && resultCount > 0 && resultCount < status.messageCount) {
@@ -686,6 +739,8 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
         const effectiveQuery = aggregate
           ? input.query
           : `${input.query}${buildExtractClauses(input.extract)} | sort by _messagetime asc`;
+        const extractAliases = Object.keys(input.extract ?? {});
+        const fillCounter = extractAliases.length > 0 ? new ExtractFillCounter(extractAliases) : undefined;
         const { created } = await createJob({ ...input, query: effectiveQuery }, extra.signal);
         jobId = created.id;
         const wait = await waitForCompletion(api, jobId, {
@@ -737,6 +792,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
                 ? (p) => report(`exported ${p.collected} messages`)
                 : undefined,
               onPage: async (page) => {
+                if (fillCounter) for (const m of page.messages) fillCounter.observe(m.map);
                 const lines = page.messages.map((m) => {
                   const flat = flattenMessage(m.map);
                   // _raw is dropped: it is a bulky duplicate of the flattened fields.
@@ -777,6 +833,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
           `job messageCount=${status.messageCount} recordCount=${status.recordCount}`,
         ];
         if (status.recordCount === 0) lines.push('order: chronological (oldest→newest by _messagetime)');
+        if (fillCounter) lines.push(...fillCounter.warnings());
         if (truncated) lines.push('TRUNCATED: hit the export/message cap — split the time range to get everything.');
         if (wait.partial) lines.push('PARTIAL: search did not finish before the wait timeout; exported what was gathered — line order is NOT guaranteed for a partial export.');
         const warns = realWarnings(status);
@@ -1011,6 +1068,13 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
             const conf = confidentZeroFill(det);
             if (conf !== undefined) {
               body = calmZeroBlock(conf, det.scopeTotal);
+              // §0.2.1 #2: calm-clean AND an EXACT _sourcecategory=<X> (no wildcard) → one
+              // extra volume-only probe over the <X>* prefix to catch excluded siblings.
+              const exact = exactSourceCategoryTerm(base);
+              if (exact !== undefined) {
+                const note = await siblingCoverageNote(input, base, exact, det.scopeTotal, range, extra.signal);
+                if (note !== undefined) body += `\n${note}`;
+              }
             } else {
               const mLabel =
                 det.cachedAgeMs !== undefined
@@ -1496,7 +1560,9 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
         monitorQuery: z.string().min(1).optional()
           .describe('Keyword filter (e.g. a monitor-name fragment), matched full-text against the alert event JSON.'),
         status: z.array(z.string().min(1)).min(1).optional()
-          .describe('Client-side filter on trigger states seen across an alert\'s events (e.g. ["Critical","Warning"]; case-insensitive).'),
+          .describe('Client-side filter on trigger state (e.g. ["Critical","Warning"]; case-insensitive). By default matches the alert\'s LATEST state — a resolved Critical alert now shows [Normal] and is EXCLUDED. Use statusScope:"ever" for the old lifetime behavior.'),
+        statusScope: z.enum(['latest', 'ever']).optional()
+          .describe('How `status` matches (default "latest"): "latest" = the alert\'s current/most-recent state; "ever" = any state seen across its lifetime events.'),
         limit: z.number().int().min(1).max(500).optional()
           .describe('Max fired alerts returned (default 50).'),
       },
@@ -1543,14 +1609,13 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
           },
         });
 
-        let alerts = correlateAlertEvents(events);
+        // Collapse near-simultaneous duplicate instances (same monitor, distinct alertIds
+        // per evaluation) BEFORE filtering — so both counts and the status filter see the
+        // collapsed rows.
+        let alerts = collapseDuplicateAlerts(correlateAlertEvents(events));
+        const statusScope = input.statusScope ?? 'latest';
         if (input.status !== undefined && input.status.length > 0) {
-          const wanted = new Set(input.status.map((s) => s.toLowerCase()));
-          alerts = alerts.filter(
-            (a) =>
-              a.statesSeen.some((s) => wanted.has(s.toLowerCase())) ||
-              (a.lastStatus !== undefined && wanted.has(a.lastStatus.toLowerCase())),
-          );
+          alerts = filterAlertsByStatus(alerts, input.status, statusScope);
         }
 
         const fmtBound = (label: string | number, ms: number | undefined) =>
@@ -1560,6 +1625,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
           scannedEvents: res.collected,
           limit: input.limit ?? 50,
           statusFilter: input.status,
+          statusScope,
         });
 
         const notes: string[] = [];

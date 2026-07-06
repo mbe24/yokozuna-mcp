@@ -39,3 +39,39 @@ export function buildExtractClauses(extract: Record<string, string> | undefined)
   }
   return out;
 }
+
+/**
+ * §0.2.1 #5: an extracted path absent on the matched rows yields an all-`""` column
+ * silently (nodrop). Count non-empty values per extract alias over the fetched rows and
+ * warn on any alias with 0 non-empty — silence must never read as "the field is empty".
+ */
+export class ExtractFillCounter {
+  private readonly nonEmpty = new Map<string, number>();
+  private total = 0;
+
+  constructor(aliases: string[]) {
+    for (const a of aliases) this.nonEmpty.set(a, 0);
+  }
+
+  observe(map: Record<string, string>): void {
+    this.total += 1;
+    for (const [alias, n] of this.nonEmpty) {
+      const v = map[alias];
+      if (v !== undefined && v !== '') this.nonEmpty.set(alias, n + 1);
+    }
+  }
+
+  /** One warning line per all-empty alias; empty when no rows were observed. */
+  warnings(): string[] {
+    if (this.total === 0) return [];
+    const out: string[] = [];
+    for (const [alias, n] of this.nonEmpty) {
+      if (n === 0) {
+        out.push(
+          `extract "${alias}": 0/${this.total} non-empty — the path may not exist on these rows; run sumo_describe_schema.`,
+        );
+      }
+    }
+    return out;
+  }
+}

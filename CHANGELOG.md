@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.2.1 — correctness patch
+
+Five confirmed misleading-output fixes plus a describe→digest handoff line. No config
+changes; still zero-config (only `SUMO_ACCESS_ID` + `SUMO_ACCESS_KEY`).
+
+### Fixed
+
+- **`sumo_list_alerts` `status` filtered on lifetime state, not current.** It matched any
+  state an alert had EVER been in, so a resolved Critical alert (now `[Normal]`) still
+  matched `status:["Critical"]` — effectively returning every alert. The filter now
+  matches the alert's LATEST state by default. New `statusScope: "latest" | "ever"` param
+  (default `"latest"`) restores the old lifetime behavior when explicitly requested.
+- **Duplicate alert instances inflated the counts.** Sumo fires DISTINCT alert instances
+  (separate alertIds) per monitor evaluation, near-simultaneously. Instances with the
+  same `monitorId` fired within ≤5s are now collapsed into one row annotated
+  `×N instances`; the summary counts reflect the collapsed rows.
+- **`sumo_facets` split int/float forms of a numeric field.** A field emitting both `"2"`
+  and `"2.0"` rendered as two indistinguishable rows with split counts. Rows are now
+  merged by their coerced numeric key (counts summed), re-sorted desc, and the merged row
+  is annotated `(int+float forms)`.
+- **`extract` silently produced empty columns.** An extracted path absent on the matched
+  rows yielded an all-`""` column with no warning. `sumo_run_search` and
+  `sumo_export_results` now count non-empty values per alias and warn
+  `extract "<alias>": 0/<N> non-empty — the path may not exist on these rows; run
+  sumo_describe_schema.`
+- **`sumo_error_digest` calm-clean reads could be under-scoped.** When a digest is about
+  to print the CALM "genuinely clean" block for an EXACT `_sourcecategory=<X>` (no
+  wildcard), it now runs ONE extra volume-only `count by _sourcecategory` over the `<X>*`
+  prefix. If sibling/child categories carry non-trivial volume, it appends a COVERAGE
+  note (not an error claim) listing the top-5 siblings and suggesting `_sourcecategory=<X>*`.
+  Coverage/volume only — the detected error predicate is never run over the prefix.
+
+### Added
+
+- **describe→digest handoff line**: each ranked candidate in `sumo_describe_schema` output
+  now ends with a copy-paste `next: sumo_error_digest query="<scope>" filter='<fragment>'`
+  line (fragments are already paste-ready via the shared predicate builder).
+
 ## 0.2.0 — schema-learning triage
 
 Behavior + interface changes. The MCP now works out-of-the-box on ANY log schema with

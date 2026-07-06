@@ -89,10 +89,12 @@ export interface FiredAlert {
   resolvedAtMs?: number;
   /** State from the latest correlated event (e.g. Critical / Normal after resolve). */
   lastStatus?: string;
-  /** Every state seen across the correlated events (status filtering matches any). */
+  /** Every state seen across the correlated events (statusScope:"ever" matches these). */
   statesSeen: string[];
   isMuted?: boolean;
   events: number;
+  /** Near-simultaneous duplicate instances collapsed into this row (1 = no duplicates). */
+  instances: number;
 }
 
 /** Correlate create/update/resolve events into one row per fired alert, newest first. */
@@ -121,9 +123,101 @@ export function correlateAlertEvents(events: AlertEvent[]): FiredAlert[] {
       statesSeen: [...new Set(g.map((e) => e.status).filter((s): s is string => !!s))],
       isMuted: g.some((e) => e.isMuted === true) ? true : g.find((e) => e.isMuted !== undefined)?.isMuted,
       events: g.length,
+      instances: 1,
     });
   }
   return alerts.sort((a, b) => (b.firedAtMs ?? 0) - (a.firedAtMs ?? 0));
+}
+
+/**
+ * Sumo fires DISTINCT alert instances (separate alertIds) per evaluation of the same
+ * monitor — near-simultaneous creates whose resolves can differ by up to ~60s, so any
+ * (monitorId, resolve-time) dedupe key is wrong. Correct collapse key: same `monitorId`
+ * AND `firedAt` within this window of the cluster's first instance.
+ */
+export const INSTANCE_COLLAPSE_WINDOW_MS = 5_000;
+
+/**
+ * Collapse duplicate instances (same monitor, fired within the window) into ONE row:
+ * fired-at = earliest, resolved-at = latest (open if ANY instance is still open),
+ * lastStatus from the instance with the latest activity, states/events/instances merged.
+ * Rows missing a monitorId or fired-at are never collapsed.
+ */
+export function collapseDuplicateAlerts(
+  alerts: FiredAlert[],
+  windowMs = INSTANCE_COLLAPSE_WINDOW_MS,
+): FiredAlert[] {
+  const collapsible = alerts.filter((a) => a.monitorId !== undefined && a.firedAtMs !== undefined);
+  const passthrough = alerts.filter((a) => a.monitorId === undefined || a.firedAtMs === undefined);
+
+  const byMonitor = new Map<string, FiredAlert[]>();
+  for (const a of collapsible) {
+    const g = byMonitor.get(a.monitorId!);
+    if (g) g.push(a);
+    else byMonitor.set(a.monitorId!, [a]);
+  }
+
+  const out: FiredAlert[] = [...passthrough];
+  for (const [, g] of byMonitor) {
+    g.sort((a, b) => a.firedAtMs! - b.firedAtMs!);
+    let cluster: FiredAlert[] = [];
+    const flush = () => {
+      if (cluster.length === 0) return;
+      if (cluster.length === 1) {
+        out.push(cluster[0]!);
+        return;
+      }
+      const anyOpen = cluster.some((a) => a.resolvedAtMs === undefined);
+      const latest = cluster.reduce((a, b) =>
+        (b.resolvedAtMs ?? b.firedAtMs!) >= (a.resolvedAtMs ?? a.firedAtMs!) ? b : a,
+      );
+      out.push({
+        ...cluster[0]!,
+        firedAtMs: Math.min(...cluster.map((a) => a.firedAtMs!)),
+        resolvedAtMs: anyOpen ? undefined : Math.max(...cluster.map((a) => a.resolvedAtMs!)),
+        lastStatus: latest.lastStatus,
+        statesSeen: [...new Set(cluster.flatMap((a) => a.statesSeen))],
+        isMuted: cluster.some((a) => a.isMuted === true)
+          ? true
+          : cluster.find((a) => a.isMuted !== undefined)?.isMuted,
+        events: cluster.reduce((s, a) => s + a.events, 0),
+        instances: cluster.reduce((s, a) => s + a.instances, 0),
+      });
+    };
+    for (const a of g) {
+      if (cluster.length > 0 && a.firedAtMs! - cluster[0]!.firedAtMs! <= windowMs) {
+        cluster.push(a);
+      } else {
+        flush();
+        cluster = [a];
+      }
+    }
+    flush();
+  }
+  return out.sort((a, b) => (b.firedAtMs ?? 0) - (a.firedAtMs ?? 0));
+}
+
+export type StatusScope = 'latest' | 'ever';
+
+/**
+ * The `status` filter. Default scope "latest" matches the alert's CURRENT/most recent
+ * state — a resolved Critical alert shows [Normal] and does NOT match ["Critical"].
+ * Scope "ever" restores the lifetime behavior (any state seen across the events).
+ */
+export function filterAlertsByStatus(
+  alerts: FiredAlert[],
+  statuses: string[],
+  scope: StatusScope,
+): FiredAlert[] {
+  const wanted = new Set(statuses.map((s) => s.toLowerCase()));
+  if (scope === 'ever') {
+    return alerts.filter(
+      (a) =>
+        a.statesSeen.some((s) => wanted.has(s.toLowerCase())) ||
+        (a.lastStatus !== undefined && wanted.has(a.lastStatus.toLowerCase())),
+    );
+  }
+  return alerts.filter((a) => a.lastStatus !== undefined && wanted.has(a.lastStatus.toLowerCase()));
 }
 
 function humanDuration(ms: number): string {
@@ -139,6 +233,7 @@ export interface RenderAlertsOptions {
   scannedEvents: number;
   limit: number;
   statusFilter?: string[];
+  statusScope?: StatusScope;
 }
 
 export function renderAlerts(alerts: FiredAlert[], opts: RenderAlertsOptions): string {
@@ -147,7 +242,7 @@ export function renderAlerts(alerts: FiredAlert[], opts: RenderAlertsOptions): s
   lines.push(
     `fired alerts: ${alerts.length} (correlated from ${opts.scannedEvents} create/resolve events in the System Event Index, ${opts.rangeLabel})` +
       (opts.statusFilter && opts.statusFilter.length > 0
-        ? ` status filter: ${opts.statusFilter.join(',')}`
+        ? ` status filter: ${opts.statusFilter.join(',')} (${opts.statusScope === 'ever' ? 'any state ever seen' : 'latest state'})`
         : ''),
   );
   if (alerts.length === 0) {
@@ -168,6 +263,7 @@ export function renderAlerts(alerts: FiredAlert[], opts: RenderAlertsOptions): s
       a.monitorName ?? '?',
       `monitorId=${a.monitorId ?? '—'}`,
     ];
+    if (a.instances > 1) parts.push(`×${a.instances} instances`);
     if (a.monitorPath) parts.push(`path=${a.monitorPath}`);
     if (a.isMuted) parts.push('MUTED');
     lines.push(parts.join(' '));

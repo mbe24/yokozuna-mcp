@@ -1,6 +1,6 @@
 {
   "name": "yokozuna-mcp",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "MCP server (stdio) wrapping the Sumo Logic Search Job API for agent-driven log triage",
   "type": "module",
   "license": "Apache-2.0",

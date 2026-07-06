@@ -242,4 +242,23 @@ describe('renderDescription', () => {
     expect(out).toContain('describe_schema PROPOSES — you decide');
     expect(out).toContain('candidate severity filters: NONE');
   });
+
+  it('emits a paste-ready next: sumo_error_digest handoff line per candidate (§0.2.1 c)', () => {
+    const out = renderDescription({
+      scope: '_sourcecategory=k8s/team/api',
+      rangeLabel: 'a .. b',
+      stratField: undefined,
+      plan: buildSamplePlan([{ category: 'k8s/team/api', value: '', count: 100 }], 10),
+      sampledCount: 10,
+      profile: profileSample([{ raw: JSON.stringify({ log: { m: 1 } }), stratumLabel: 'k8s/team/api' }], 4),
+      cats: [],
+      candidates: [
+        { fragment: '(\"[error]\" OR \"[crit]\")', rationale: 'string payload', caveats: ['token noise'] },
+      ],
+      notes: [],
+    });
+    expect(out).toContain(
+      `next: sumo_error_digest query="_sourcecategory=k8s/team/api" filter='("[error]" OR "[crit]")'`,
+    );
+  });
 });
