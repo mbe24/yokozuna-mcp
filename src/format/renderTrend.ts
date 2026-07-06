@@ -1,3 +1,5 @@
+import { coerceNumericDisplay } from './flatten.js';
+
 /**
  * sumo_trend rendering: aggregate records of `... | timeslice <interval> | count by
  * _timeslice[, <dim>]` become one compact sparkline line per series.
@@ -18,7 +20,7 @@ export interface TrendRenderOptions {
   toLabel: string;
   intervalLabel: string;
   intervalMs: number;
-  /** Series dimension name ("levelname", "_sourcehost", … or "none" for a single total). */
+  /** Series label (detected field, "_sourcehost", "token class", … or "none" for a total). */
   by: string;
   /** Max series rendered (ranked by total, rest merged into "(other)"). */
   maxSeries: number;
@@ -36,6 +38,7 @@ function sparkline(counts: number[]): string {
 
 export function renderTrend(opts: TrendRenderOptions, rows: TrendRow[]): string {
   if (rows.length === 0) return 'trend: no matching messages in this time range.';
+  const allNone = opts.by !== 'none' && rows.every((r) => r.key === '');
 
   const minSlice = Math.min(...rows.map((r) => r.sliceMs));
   const maxSlice = Math.max(...rows.map((r) => r.sliceMs));
@@ -59,7 +62,11 @@ export function renderTrend(opts: TrendRenderOptions, rows: TrendRow[]): string 
   }
 
   const ranked = [...series.entries()]
-    .map(([key, counts]) => ({ key: key === '' ? '(none)' : key, counts, total: counts.reduce((a, b) => a + b, 0) }))
+    .map(([key, counts]) => ({
+      key: key === '' ? '(none)' : coerceNumericDisplay(key),
+      counts,
+      total: counts.reduce((a, b) => a + b, 0),
+    }))
     .sort((a, b) => b.total - a.total);
 
   let shown = ranked;
@@ -84,6 +91,11 @@ export function renderTrend(opts: TrendRenderOptions, rows: TrendRow[]): string 
   for (const s of shown) {
     lines.push(
       `${s.key.padEnd(keyWidth)}  total=${String(s.total).padStart(totalWidth)}  ${sparkline(s.counts)}  [${s.counts.join(' ')}]`,
+    );
+  }
+  if (allNone) {
+    lines.push(
+      '(100% (none) — the series field may not exist at this path in this scope; run sumo_describe_schema)',
     );
   }
   return lines.join('\n');

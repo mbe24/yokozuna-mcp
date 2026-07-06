@@ -85,29 +85,40 @@ describe('loadConfig', () => {
     expect(cfg2.defaultTimeZone).toBe('Europe/Stockholm');
   });
 
-  it('applies defaults for levelExpr, settleMarginSeconds, and facetDimensions', () => {
+  it('applies NATIVE-ONLY facet-dimension defaults and the settle-margin default', () => {
     const cfg = loadConfig({ ...baseEnv });
-    expect(cfg.levelExpr).toBe('log.levelname');
     expect(cfg.settleMarginSeconds).toBe(180);
-    expect(cfg.facetDimensions).toEqual([
-      '_sourcecategory',
-      '_sourcehost',
-      'levelname',
-      'status',
-      'path',
-    ]);
+    // §10.1: defaults must assume nothing about the payload schema.
+    expect(cfg.facetDimensions).toEqual(['_sourcecategory', '_sourcehost']);
   });
 
-  it('accepts overrides for levelExpr, settleMarginSeconds, and facetDimensions', () => {
+  it('accepts overrides for settleMarginSeconds and facetDimensions', () => {
     const cfg = loadConfig({
       ...baseEnv,
-      YOKOZUNA_LEVEL_EXPR: 'log.severity',
       YOKOZUNA_SETTLE_MARGIN_SECONDS: '60',
       YOKOZUNA_FACET_DIMENSIONS: ' _collector , logger ,, status ',
     });
-    expect(cfg.levelExpr).toBe('log.severity');
     expect(cfg.settleMarginSeconds).toBe(60);
     expect(cfg.facetDimensions).toEqual(['_collector', 'logger', 'status']);
+  });
+
+  it('YOKOZUNA_LEVEL_EXPR (removed in 0.2.0) warns loudly instead of silently ignoring', () => {
+    const warnings: string[] = [];
+    const cfg = loadConfig(
+      { ...baseEnv, YOKOZUNA_LEVEL_EXPR: 'log.severity' },
+      (m) => warnings.push(m),
+    );
+    expect(warnings.length).toBe(1);
+    expect(warnings[0]).toContain('YOKOZUNA_LEVEL_EXPR');
+    expect(warnings[0]).toContain('removed in 0.2.0');
+    expect(warnings[0]).toContain('filter=');
+    expect('levelExpr' in cfg).toBe(false);
+  });
+
+  it('emits no warning when YOKOZUNA_LEVEL_EXPR is unset', () => {
+    const warnings: string[] = [];
+    loadConfig({ ...baseEnv }, (m) => warnings.push(m));
+    expect(warnings).toEqual([]);
   });
 
   it('applies defaults for maxResponseChars and the keepalive knobs', () => {

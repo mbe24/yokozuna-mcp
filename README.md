@@ -12,6 +12,11 @@ editor.
 - Deployment default: **EU** (`api.eu.sumologic.com`), configurable
 - Token-economical by default: lean output with explicit levers (`detail`, `fields`,
   `dedupe`), bulk data goes to files instead of your context window
+- **Zero-config & schema-learning**: only `SUMO_ACCESS_ID` + `SUMO_ACCESS_KEY` are
+  required. Severity schemas vary per system — the triage tools **auto-detect** each
+  scope's severity signal at call time and **disclose** exactly what they applied
+  (predicate, provenance, matched-N-of-M); `sumo_describe_schema` learns any scope's
+  schema in depth and proposes paste-ready filters. No schema config exists, on purpose.
 
 This README is self-sufficient: following it top-to-bottom from a checkout of this repo
 yields a working, registered MCP server.
@@ -73,19 +78,22 @@ npm link
 | `YOKOZUNA_DEFAULT_DETAIL` | no | `compact` | `summary` \| `compact` \| `full` \| `raw`. |
 | `YOKOZUNA_DEFAULT_LIMIT` | no | `100` | Default inline result limit. |
 | `YOKOZUNA_MAX_MESSAGE_CHARS` | no | `10000` | Safety cap for the `message` field. |
-| `YOKOZUNA_LEVEL_EXPR` | no | `log.levelname` | JSON path (inside `_raw`) of the log level — used by `detail: "summary"` side-aggregates, `sumo_error_digest`, and the `levelname` facet. |
 | `YOKOZUNA_SETTLE_MARGIN_SECONDS` | no | `180` | `sumo_new_since` freshness lag: poll windows end at `now − margin` so late-arriving logs are never skipped (complete but that many seconds stale). |
-| `YOKOZUNA_FACET_DIMENSIONS` | no | `_sourcecategory,_sourcehost,levelname,status,path` | Default `sumo_facets` dimensions (comma-separated). `_`-prefixed = native fields; anything else is parsed as `log.<dimension>`. |
+| `YOKOZUNA_FACET_DIMENSIONS` | no | `_sourcecategory,_sourcehost` | Default `sumo_facets` dimensions (comma-separated). `_`-prefixed = native fields; anything else is an **absolute JSON path from the `_raw` root** (e.g. `stream`, `log.levelname`). |
 | `YOKOZUNA_MAX_RESPONSE_CHARS` | no | `200000` | **Whole-response** safety cap (chars) for inline tool results. Oversized responses are tail-truncated with a pointer to `sumo_export_results`; header/count lines come first and always survive. |
 | `YOKOZUNA_KEEPALIVE_IDLE_MINUTES` | no | `10` | Minutes a kept job (`sumo_create_search_job` / `keepJob: true`) may sit idle before the server deletes it. Any access (status/messages/records) resets the timer. |
 | `YOKOZUNA_KEEPALIVE_MAX_JOBS` | no | `20` | Max jobs the keepalive tracks at once; beyond the cap the stalest job is evicted (logged to stderr with the job id) and left to expire server-side. |
+
+> **Removed in 0.2.0:** `YOKOZUNA_LEVEL_EXPR`. Severity is auto-detected per scope at
+> call time (and disclosed in tool output); use the per-call `filter=` parameter for
+> overrides. Setting the variable produces a startup warning.
 
 See `.env.example` for a commented template. Never commit a filled-in `.env`.
 
 ## Step 3 — Smoke-test the server (optional but recommended)
 
 With a filled-in `.env` in the repo root, this sends a real MCP handshake plus
-`tools/list` over stdio and exits. Expect a `tools` array with **12 tools** on stdout and
+`tools/list` over stdio and exits. Expect a `tools` array with **14 tools** on stdout and
 only `[yokozuna-mcp] server started (stdio)` on stderr.
 
 bash / Git Bash:
@@ -156,7 +164,7 @@ project where you want to use it** (shared, project scope):
 ```
 
 Verify with `claude mcp list` — `yokozuna` should show as connected. In a Claude Code
-session, `/mcp` shows the server, its 12 tools, and the `triage` prompt
+session, `/mcp` shows the server, its 14 tools, and the `triage` prompt
 (available as `/mcp__yokozuna__triage`).
 
 > Do not commit a `.mcp.json` containing the real access key to a shared repo — prefer
@@ -202,11 +210,13 @@ chat input.
 | `sumo_get_records` | Primitive: page aggregate records (aggregate jobs). | `id`, `offset`, `limit` (≤10000), `format` |
 | `sumo_delete_search_job` | Primitive: delete a job (idempotent; already-gone is OK). | `id` |
 | `sumo_export_results` | Run a search and stream **all** results (up to 100k) to an NDJSON file; returns the path, not the payload. Lines are **chronological** (oldest→newest by `_messagetime`; the server appends `\| sort by _messagetime asc` to non-aggregate queries — a PARTIAL/timed-out export may not be fully ordered). | `query`, time range, `maxMessages`, `extract` |
-| `sumo_facets` | See the **shape** first: one `count by` aggregate per dimension (concurrent, auto-deleted), ranked top-N table each. `_`-prefixed dims are native fields; others parse `log.<dim>` from `_raw`. One failing dimension = an error line, never a total failure. | `query`, time range, `dimensions`, `limit` (top-N per dim, default 15) |
-| `sumo_error_digest` | One-call triage: filter to ERROR/WARNING (via `YOKOZUNA_LEVEL_EXPR`), group by normalized signature, return top-N with count, first/last seen, a sample `request_id`, and `_sourcecategory`. | `query` (default `_sourcecategory=<SUMO_DEFAULT_SOURCE_CATEGORY>`), time range, `levels`, `limit`, `maxScan` (default 5000) |
-| `sumo_new_since` | Stateless **monitoring cursor**: returns messages that *arrived* since the last call plus a `cursor=<epoch ms>` line; pass it back as `since` for contiguous, gap-free windows. `byReceiptTime` forced true; aggregate queries rejected. | `query`, `since` (cursor), `lookback` (baseline, default `"15m"`), `limit`, `detail`/`fields`/`dedupe`/`sort`/`format` |
-| `sumo_trend` | See **when** things happened: `\| timeslice` counts per bucket split into series (default: log level via `YOKOZUNA_LEVEL_EXPR`), rendered as one sparkline + per-bucket counts per series. One aggregate job, auto-deleted. | `query` (plain scope, no `\|` aggregates), time range, `interval` (default auto ≤40 buckets), `by` (`levelname` \| `_native` field \| `none` \| `log.<field>` name), `maxSeries` (default 8) |
-| `sumo_list_monitors` | Read-only list of the org's **native Sumo Monitors** (24/7 prod alerting): name, folder path, type, enabled/disabled, current status, trigger types, notification destinations. Requires the **View Monitors** capability (clear error otherwise); no search jobs involved. | `query` (name/content filter), `limit` (default 100) |
+| `sumo_facets` | See the **shape** first: one `count by` aggregate per dimension (concurrent, auto-deleted), ranked top-N table each. `_`-prefixed dims are native fields; others are **absolute JSON paths from the `_raw` root** (`stream`, `log.levelname`). An all-`(none)` dimension is annotated with a `sumo_describe_schema` hint. One failing dimension = an error line, never a total failure. | `query`, time range, `dimensions` (default `_sourcecategory,_sourcehost`), `limit` (top-N per dim, default 15) |
+| `sumo_error_digest` | One-call triage: **auto-detects** the scope's severity signal (schemas vary — word levels, numeric tiers + typed exception rows, string-token payloads), applies it, groups by normalized signature, and returns top-N with count, first/last seen, a sample `request_id`, and `_sourcecategory`. Every response **discloses** the applied filter with a matched-N-of-M line; zero matches on a non-empty scope render a loud guardrail, never silence. | `query` (default `_sourcecategory=<SUMO_DEFAULT_SOURCE_CATEGORY>`), time range, `filter` (agent-supplied override; skips detection), `limit`, `maxScan` (default 5000) |
+| `sumo_new_since` | Stateless **monitoring cursor**: returns messages that *arrived* since the last call plus a `cursor=<epoch ms>` line; pass it back as `since` for contiguous, gap-free windows. `byReceiptTime` forced true; aggregate queries rejected. `detail:"summary"` adds the exact whole-job severity counts. | `query`, `since` (cursor), `lookback` (baseline, default `"15m"`), `limit`, `detail`/`fields`/`dedupe`/`sort`/`format` |
+| `sumo_trend` | See **when** things happened: `\| timeslice` counts per bucket split into series (default: the scope's **auto-detected** severity field, disclosed in the output), rendered as one sparkline + per-bucket counts per series. Jobs auto-deleted. | `query` (plain scope, no `\|` aggregates), time range, `interval` (default auto ≤40 buckets), `by` (`_native` field \| `none` \| absolute JSON path), `filter`, `maxSeries` (default 8) |
+| `sumo_describe_schema` | **Learn a scope's schema in depth (propose-only)**: stratified sampling (never first-N), top-level + nested key enumeration (fill %, types, top values), string-payload characterization, per-(category×type) breakdown, and ranked **paste-ready `filter=` fragments** with honest caveats. Applies nothing, persists nothing. | `query`, time range, `sampleSize` (default 200), `stratifyBy`, `maxDepth` (default 4) |
+| `sumo_list_monitors` | Read-only list of the org's **native Sumo Monitors** (24/7 prod alerting): summary header + name, folder path, type, enabled/disabled, current status, trigger types, notification destinations. Requires the **View Monitors** capability (clear error otherwise); no search jobs involved. Free-text matching is **name-only substring** — folder paths are not searched. | `query` (name filter), `status` (multi = unioned API calls), `limit` (default 100) |
+| `sumo_list_alerts` | **Fired-alert history** from the documented System Event Index (`_index=sumologic_system_events _sourceCategory=alerts`) via the Search Job API: correlates create/resolve events into one line per fired alert with fired-at, resolved-at, status, and the `monitorId` + name **join keys** to `sumo_list_monitors`. | time range, `monitorQuery`, `status`, `limit` (default 50) |
 
 **Time range** (all search tools): exactly one of `last` (`"15m"`, `"2h"`, `"1d"`; units
 `s/m/h/d`) or both `from`+`to` (ISO-8601 like `2026-07-02T18:28:00`, or epoch ms). Optional
@@ -251,18 +261,20 @@ Example `sumo_trend` call (when did it start/spike? — one sparkline per level)
 ```
 
 ```
-trend by levelname: 2026-07-03T16:00:00.000Z .. 2026-07-03T18:00:00.000Z, interval=5m, buckets=24 (…)
+series (auto-detected): log.levelname — word-level family; syntax only, semantics unverified. Override with by= / filter=.
+trend by log.levelname: 2026-07-03T16:00:00.000Z .. 2026-07-03T18:00:00.000Z, interval=5m, buckets=24 (…)
 INFO     total=53210  ▅▅▆▅▅▅▄▅▅█▅▅▅▄▅▅▅▅▅▅▄▅▅▅  [2226 2221 …]
 ERROR    total=12     ▁▁▁▁▁▁▁▁▁█▁▁▂▁▁▁▁▁▁▁▁▁▁▁  [0 0 …]
 ```
 
 `interval` defaults to the smallest nice step (`10s…1d`) giving ≤40 buckets; `by`
-accepts `levelname` (default; parsed via `YOKOZUNA_LEVEL_EXPR`), a `_native` field
-(e.g. `_sourcecategory`), any `log.<field>` name (e.g. `status`), or `none` for one
-total series.
+defaults to the scope's **auto-detected** severity field (disclosed, as above) and
+accepts a `_native` field (e.g. `_sourcecategory`), an **absolute JSON path** from the
+`_raw` root (e.g. `stream`, `log.status`), or `none` for one total series. `filter`
+applies a raw fragment before the timeslice (e.g. trend only the errors).
 
 Example `sumo_facets` call (see the shape before reading messages — where do matching
-logs come from, which levels/statuses/paths dominate):
+logs come from):
 
 ```json
 {
@@ -272,10 +284,12 @@ logs come from, which levels/statuses/paths dominate):
 }
 ```
 
-Default dimensions: `_sourcecategory`, `_sourcehost`, `levelname`, `status`, `path`
-(override per call with `dimensions`, or globally with `YOKOZUNA_FACET_DIMENSIONS`).
-Each dimension is one small concurrent aggregate job, auto-deleted; a dimension that
-fails renders as an error line without failing the rest.
+Default dimensions are native-only: `_sourcecategory`, `_sourcehost` (override per call
+with `dimensions` — e.g. `["stream", "log.levelname"]`; absolute paths from the `_raw`
+root — or globally with `YOKOZUNA_FACET_DIMENSIONS`). Each dimension is one small
+concurrent aggregate job, auto-deleted; a dimension that fails renders as an error line
+without failing the rest, and a dimension that is 100% `(none)` is annotated (the field
+probably does not exist at that path — run `sumo_describe_schema`).
 
 Example `sumo_error_digest` call (deduplicated "what is broken" summary — counts,
 first/last occurrence, and a sample `request_id` per distinct problem):
@@ -284,14 +298,45 @@ first/last occurrence, and a sample `request_id` per distinct problem):
 {
   "query": "_sourcecategory=kubernetes/myservice/*/backend",
   "last": "2h",
-  "levels": ["ERROR", "WARNING"],
   "limit": 20
 }
 ```
 
-Omit `query` to fall back to `_sourcecategory=<SUMO_DEFAULT_SOURCE_CATEGORY>`. The level
-filter is appended automatically (parsing `YOKOZUNA_LEVEL_EXPR`, default `log.levelname`)
-— pass only the scope, no `|` operators.
+Omit `query` to fall back to `_sourcecategory=<SUMO_DEFAULT_SOURCE_CATEGORY>`. The
+severity filter is **auto-detected and appended automatically** — pass only the scope,
+no `|` operators. Every response opens with a disclosure block like:
+
+```
+severity filter (auto-detected): | json field=_raw "log.severity" as yz_sev nodrop | json field=_raw "log.type" as yz_type nodrop | where num(yz_sev) >= 3 or yz_sev in ("Fatal","Error","ERROR","error","Warning","WARNING","warning") or yz_type = "exception"
+  detected from: 1 category in scope — kubernetes/myservice/prod→numeric+type(log.severity/log.type)
+  matched: 1,470 of 48,112 in-scope messages (3.1%)
+  caveat: detection is SYNTACTIC — severity semantics are not verified (…). Pass filter= to
+  override; run sumo_describe_schema to learn this scope's schema in depth.
+```
+
+The **matched-N-of-M line is the false-clean killer**: `matched: 0 of 48,112` can never
+be read as "prod is clean" silently. A zero-match on a non-empty scope renders a calm
+"looks genuinely clean" note when detection was confident (the detected severity field
+fills ≥50% of in-scope messages), and a loud `!! ZERO MATCHES` guardrail when it was not
+(possible schema mismatch). A scope with no detectable severity signal is digested
+**unfiltered** by signature, with that disclosed.
+
+### Learning a schema and remembering it (the `filter=` workflow)
+
+Schemas are learned per scope, semantics are YOURS to confirm — the intended loop:
+
+1. Meet a new scope → `sumo_error_digest` auto-detects; read the disclosure block.
+2. If detection was wrong or insufficient (zero-match guardrail, no-signal, or the
+   matched signatures look like noise) → run `sumo_describe_schema` on the scope and
+   judge its ranked, paste-ready fragments. Syntax is detectable; whether a signal is a
+   real incident (e.g. `[error]` lines that are all scanner probes) is a judgment call.
+3. **Record confirmed semantics in your own memory** (CLAUDE.md / auto-memory / project
+   notes), e.g. *"scope `kubernetes/foo/*`: real errors are
+   `| json field=_raw "log.severity" as s nodrop | where num(s)>=3 or s="Fatal"`;
+   `[error]` on the frontend scope is scanner noise"*.
+4. On later calls pass `filter=` from your memory — the MCP itself stays stateless
+   (only an in-process, ~12-minute detection memo exists; disclosed as
+   `(detection cached, <age>)`).
 
 Example `sumo_new_since` polling loop (stateless monitoring — e.g. "tell me when new
 errors show up in the preview deployment"):
@@ -334,9 +379,19 @@ Successful searches include a **Sumo UI deep link**
 browser.
 
 `sumo_list_monitors` (read-only) lists the org's native Sumo Monitors for discovering
-what 24/7 prod alerting already exists — name, folder path, type, enabled/disabled,
-current status, trigger types, and notification destinations. It needs the
-**View Monitors** capability on the access key and creates no search jobs.
+what 24/7 prod alerting already exists — a summary header plus name, folder path, type,
+enabled/disabled, current status, trigger types, and notification destinations. It needs
+the **View Monitors** capability on the access key and creates no search jobs. Filter by
+`status` (e.g. `["Critical","Warning"]` — one API call per status, unioned client-side;
+the API has no OR). Footgun: free-text `query` matching is **name-only, case-insensitive
+substring** — folder paths are not searched.
+
+`sumo_list_alerts` complements it with **fired-alert history**: it queries the
+documented System Event Index (`_index=sumologic_system_events _sourceCategory=alerts`,
+enabled by default on Enterprise accounts) through the ordinary Search Job API and
+correlates the separate create/resolve events into one line per fired alert — fired-at,
+resolved-at, latest status, and the `monitorId` + monitor-name join keys back to
+`sumo_list_monitors`.
 
 ## MCP prompt: `triage`
 
@@ -344,28 +399,32 @@ The server also registers a `triage` **MCP prompt** (in Claude Code:
 `/mcp__yokozuna__triage`, with an optional `problem` argument). It encodes the
 recommended workflow — *shape first* (`sumo_facets`/`sumo_trend`/`detail:"summary"`) →
 *narrow* (`sumo_error_digest`, then `compact` reads) → *trace* (quoted `request_id`,
-no other filters) → *bulk export* — plus the full query cookbook (severity filtering
-via `log.levelname`, the hostname-keyword caveat, noise exclusion, `extract`, and
-`byReceiptTime`). The cookbook lives in the prompt rather than in every tool
-description to keep per-call token cost down.
+no other filters) → *bulk export* — plus the full query cookbook (severity-schema
+variance and the detect-disclose-override loop, the hostname-keyword caveat, noise
+exclusion, `extract`, and `byReceiptTime`). The cookbook lives in the prompt rather
+than in every tool description to keep per-call token cost down.
 
 ## Token economy
 
 Log messages are huge (~33 metadata fields + a nested JSON `log` object). The tools are
 lean by default and give the agent explicit levers:
 
-- **`detail`** — `summary` (**exact whole-job per-level counts** via a side aggregate,
-  compact histogram sparkline, top message signatures; sections computed from the fetched
-  page are labeled `— sample` — cheapest) · `compact` (**default**: timestamp, level,
+- **`detail`** — `summary` (**exact whole-job counts by the auto-detected severity
+  field** via a side aggregate — provenance disclosed, e.g.
+  `by log.severity (auto-detected; exact, whole job)` — plus a compact histogram
+  sparkline and top message signatures; anything computed from the fetched page alone is
+  labeled loudly as a `SAMPLE` — cheapest) · `compact` (**default**: timestamp, level,
   `request_id`, `_sourcecategory`, the **full `message`**, plus `method`/`path`/`status`
   when present on request logs) · `full` (compact + `duration_s/logger/client_ip`) ·
   `raw` (verbatim `_raw` — returns logs exactly as the application emitted them, including
   anything sensitive the app logged).
 - **`fields`** — explicit projection from the flattened namespace (level/`request_id` are
   always kept for cross-referencing).
-- **`dedupe`** — group repeated messages **globally** by (level, normalized signature):
-  timestamps, UUIDs, hex runs and numbers are normalized away, so the same log statement
-  with varying values collapses into `first_ts..last_ts LEVEL ×N message`.
+- **`dedupe`** — group repeated messages **within the returned page** by (level,
+  normalized signature): timestamps, UUIDs, hex runs and numbers are normalized away, so
+  the same log statement with varying values collapses into
+  `first_ts..last_ts LEVEL ×N message` (raise `limit` for broader grouping). With
+  `detail:"raw"` each group keeps one verbatim `_raw` exemplar.
 - **`sort`** — `asc` (**default**: oldest→newest, best for tracing) or `desc` by
   `_messagetime`. Client-side: it orders only the **returned** result set — raise `limit`
   or narrow the query for full ordering. Not applicable to aggregate records.
@@ -390,15 +449,16 @@ is unreliable and usually matches nothing. Scope and filter using these instead:
 - **Where**: `_sourcecategory=<path>` (e.g. `kubernetes/myservice/*/backend`) — the primary
   scoping dimension. Discover categories from the `[in brackets]` in any result line, or
   with `| count by _sourcecategory`.
-- **Which environment**: add the deployment **hostname as a keyword** (matches `request_url`)
-  — but see the request-logs-only caveat below.
-- **Severity**: parse `log.levelname` (see #2) — not a class name, not `_loglevel`.
+- **Which environment**: add the deployment **hostname as a keyword** (matches the
+  request-URL field) — but see the request-logs-only caveat below.
+- **Severity**: schemas **vary per system** — let `sumo_error_digest` auto-detect (see #2),
+  or learn the scope with `sumo_describe_schema` and pass `filter=`.
 - **A specific request/entity**: the `request_id` (or any correlation key your logs
   carry, e.g. `session_id`, `client_ip`) as a quoted keyword (see #3).
 
-Backend logs here are structured JSON (`_raw = {stream, timestamp, log:{…}}`); the fields
-worth filtering on are `log.levelname`, `log.request_id`, `log.status`, `log.path`,
-`log.logger`, `log.pathname` — parse them with `| json field=_raw "log.<field>" as <alias>`.
+Nested JSON payload fields are parsed with `| json field=_raw "<absolute.path>" as <alias>
+nodrop` (one clause per field); discover which paths exist with `sumo_describe_schema`
+or `sumo_facets`.
 
 1. **Search by preview deployment URL / hostname keyword** (wait a few minutes for
    ingestion; use `byReceiptTime: true` for very recent windows):
@@ -413,24 +473,23 @@ worth filtering on are `log.levelname`, `log.request_id`, `log.status`, `log.pat
    > while the same search by `_sourcecategory` found them). Hunt errors by
    > `_sourcecategory`, never by hostname keyword.
 
-2. **Errors/warnings** — note `stream:"stderr"` is **NOT** the error signal; the reliable
-   level is `log.levelname` parsed from `_raw`:
+2. **Errors/warnings** — severity schemas **vary per system**: some emit word levels
+   (`log.levelname`), some numeric tiers plus typed exception rows (`log.severity`,
+   `log.type`), some plain-string payloads where an `[error]` token or stderr is the only
+   signal. Don't guess — run:
 
    ```
-   _sourcecategory=kubernetes/myservice/*/backend | json field=_raw "log.levelname" as levelname nodrop | where levelname in ("ERROR","WARNING")
+   sumo_error_digest { "query": "_sourcecategory=kubernetes/myservice/*/backend", "last": "2h" }
    ```
 
-   > **Do not filter on the top-level `_loglevel`**: it is often **empty on warnings**
-   > (~78% observed) and uses `WARN` where `levelname` says `WARNING`, so
-   > `| where _loglevel in ("ERROR","WARN")` silently misses most warnings.
+   It detects the scope's signal, applies it, and **discloses** the predicate plus a
+   matched-N-of-M line. If the disclosure says no-signal/zero-match (or the matches look
+   like noise), run `sumo_describe_schema` on the scope, pick/edit one of its paste-ready
+   fragments, confirm the semantics yourself, and pass it as `filter=` — then record the
+   confirmed fragment in your own notes for next time.
 
-   Count by level (aggregate):
-
-   ```
-   _sourcecategory=kubernetes/myservice/*/backend | json field=_raw "log.levelname" as levelname nodrop | count by levelname
-   ```
-
-   Exclude noise with negation:
+   Count by severity: `detail:"summary"` on `sumo_run_search` (exact whole-job counts by
+   the detected field). Exclude noise with negation:
 
    ```
    _sourcecategory=kubernetes/myservice/*/backend !"health check"

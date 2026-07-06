@@ -11,9 +11,30 @@ import { collectMessages, waitForCompletion, type KeepaliveRegistry } from '../s
 import { parseLast, pickTrendInterval, resolveRange } from '../sumo/time.js';
 import { buildExtractClauses, isAggregateQuery } from '../sumo/queryShape.js';
 import { buildDeepLink } from '../sumo/deepLink.js';
-import type { MonitorsApi } from '../sumo/monitorsApi.js';
+import type { MonitorsApi, MonitorSearchHit } from '../sumo/monitorsApi.js';
 import { MAX_PAGE_LIMIT, MAX_TOTAL_MESSAGES, type SearchJobStatus } from '../sumo/types.js';
-import { flattenMessage, isCookieNoiseWarning, normalizeLevel } from '../format/flatten.js';
+import {
+  detectSchema,
+  DetectionCache,
+  annotateNumWarnings,
+  confidentZeroFill,
+  formatAge,
+  type Detection,
+} from '../sumo/detectSchema.js';
+import { describeSchema } from '../sumo/describeSchema.js';
+import {
+  ALERTS_INDEX_SCOPE,
+  correlateAlertEvents,
+  parseAlertEvent,
+  renderAlerts,
+  type AlertEvent,
+} from '../sumo/alerts.js';
+import {
+  coerceNumericDisplay,
+  flattenMessage,
+  isCookieNoiseWarning,
+  normalizeLevel,
+} from '../format/flatten.js';
 import { formatMessages, sortRowsByMessageTime, type FormatOptions } from '../format/formatMessages.js';
 import { formatRecords } from '../format/formatRecords.js';
 import { renderFacets, type FacetDimensionResult } from '../format/renderFacets.js';
@@ -81,7 +102,86 @@ function realWarnings(status: SearchJobStatus): string[] {
 }
 
 const SCOPING = `
-Scoping in one line: filter WHERE with _sourcecategory=<path>, filter SEVERITY by parsing the JSON payload (| json field=_raw "log.levelname" as levelname nodrop | where levelname in ("ERROR","WARNING") — never _loglevel or stream:"stderr"), and TRACE one request by searching its quoted request_id with no other filters. Hostname keywords match only request logs — hunt errors by _sourcecategory. Full cookbook + workflow: the "triage" MCP prompt.`;
+Scoping in one line: filter WHERE with _sourcecategory=<path>. Severity schemas VARY per system — let sumo_error_digest auto-detect (it discloses what it applied), or run sumo_describe_schema on a new scope and pass filter=. TRACE one request by searching its quoted correlation id with no other filters. Hostname keywords match only request logs — hunt errors by _sourcecategory. Full workflow: the "triage" MCP prompt.`;
+
+/** Shared derived-series clause for string-payload scopes (trend series / summary counts). */
+const TOKEN_CLASS_CLAUSE =
+  ' | if(_raw matches "*[error]*","[error]", if(_raw matches "*[crit]*","[crit]", if(_raw matches "*[warn*","[warn]", "other"))) as yz_tok';
+
+/** Dimensions/series: `_native`, or an ABSOLUTE JSON path from the `_raw` root (dots ok). */
+const DIM_RE = /^_?[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)*$/;
+
+/** Append an agent-supplied `filter=` fragment verbatim (keyword terms or a `|` chain). */
+const appendFilter = (scope: string, filter: string): string => `${scope} ${filter.trim()}`;
+
+const nUS = (n: number): string => n.toLocaleString('en-US');
+
+const pctLabel = (x: number, m: number): string => {
+  if (m <= 0) return '?';
+  const pct = (x / m) * 100;
+  return `${pct === 0 || pct >= 0.1 ? pct.toFixed(1) : pct.toFixed(3)}%`;
+};
+
+/** §4.3 caveat lines — shared verbatim by digest/trend/summary disclosures. */
+const DETECTION_CAVEAT =
+  '  caveat: detection is SYNTACTIC — severity semantics are not verified (e.g. "[error]"-on-stderr\n' +
+  '  can be benign scanner noise; judge the signatures below). Pass filter= to override; run\n' +
+  "  sumo_describe_schema to learn this scope's schema in depth.";
+
+/** §4.3: the disclosure block for an auto-detected filter. matched-N-of-M is mandatory. */
+function detectionDisclosure(det: Detection, matched: number): string {
+  const cached = det.cachedAgeMs !== undefined;
+  const suffix = cached ? ` (detection cached, ${formatAge(det.cachedAgeMs!)})` : '';
+  const m = det.scopeTotal;
+  const matchedLine = cached
+    ? `  matched: ${nUS(matched)} of ~${nUS(m)} in-scope messages (${pctLabel(matched, m)} — scope total from the cached detection window)`
+    : `  matched: ${nUS(matched)} of ${nUS(m)} in-scope messages (${pctLabel(matched, m)})`;
+  return [
+    `severity filter (auto-detected): ${det.predicate!.trim()}${suffix}`,
+    `  detected from: ${det.detectedFromLine}`,
+    matchedLine,
+    DETECTION_CAVEAT,
+  ].join('\n');
+}
+
+/** §4.4: the zero-match guardrail — loud, top of output, never a bare "(no matching messages)". */
+function zeroMatchBlock(mLabel: string): string {
+  return [
+    `!! ZERO MATCHES from the severity filter, but the scope is NOT empty (${mLabel}).`,
+    "   The filter may not fit this scope's schema. Run sumo_describe_schema on this scope, then",
+    '   re-run with filter=<fragment it proposes>. Do NOT read this result as "no errors".',
+  ].join('\n');
+}
+
+/**
+ * §4.4 refinement: zero matches under a CONFIDENT detection (the detected severity field
+ * present at high fill on a non-empty scope) is a genuinely clean read — render calm, not
+ * alarming. Honest either way: the §4.3 disclosure above still shows matched 0 of M.
+ */
+function calmZeroBlock(conf: { label: string; fillN: number }, m: number): string {
+  return (
+    `no ERROR/WARNING in this window — the detected ${conf.label} is present on ` +
+    `${pctLabel(conf.fillN, m)} of ${nUS(m)} messages, so this looks genuinely clean ` +
+    '(not a schema mismatch).'
+  );
+}
+
+/** §4.4 softened variant for filter= mode, where the scope total is unknown. */
+const ZERO_MATCH_UNKNOWN_M = [
+  '!! ZERO MATCHES from the severity filter (scope total not measured in filter= mode).',
+  '   If the scope is non-empty the filter may not fit its schema. Run sumo_describe_schema on this',
+  '   scope, then re-run with filter=<fragment it proposes>. Do NOT read this result as "no errors".',
+].join('\n');
+
+/** §4.5: no-signal fallback disclosure (the digest still runs, unfiltered). */
+function noSignalDisclosure(m: number): string {
+  return [
+    'severity filter: NONE APPLIED — no severity signal detected in this scope (candidate',
+    'vocabulary: log.levelname/level/severity/loglevel/type, stream, [error]/[warn]/[crit] tokens).',
+    `Digesting ALL ${nUS(m)} messages by signature instead. Run sumo_describe_schema to learn this`,
+    "scope's fields, then pass filter=.",
+  ].join('\n');
+}
 
 const timeRangeDoc =
   'Time range: exactly ONE of `last` (relative, e.g. "15m", "2h"; units s/m/h/d) OR both `from` and `to` (ISO-8601 like 2026-07-02T18:28:00, or epoch milliseconds).';
@@ -111,7 +211,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     : '';
 
   const detailDoc =
-    'Token levers: detail=summary (whole-job level counts — exact via a side-aggregate, or a labeled sample if that fails — plus a compact histogram and top message signatures; cheapest) | compact (timestamp, level, request_id, _sourcecategory, FULL message, plus method/path/status when present) | full (compact + duration_s/logger/client_ip) | raw (verbatim _raw — logs exactly as the app emitted them, including anything sensitive it logged). See the fields/dedupe/maxMessageChars params for projection, grouping, and the message-length cap.';
+    'Token levers: detail=summary (whole-job counts by the AUTO-DETECTED severity field — exact via a side-aggregate with disclosed provenance, or a loud SAMPLE label if that fails — plus a compact histogram and top message signatures; cheapest) | compact (timestamp, level, request_id, _sourcecategory, FULL message, plus method/path/status when present) | full (compact + duration_s/logger/client_ip) | raw (verbatim _raw — logs exactly as the app emitted them, including anything sensitive it logged). See the fields/dedupe/maxMessageChars params for projection, grouping, and the message-length cap.';
 
   const timeRangeShape = {
     last: z
@@ -136,7 +236,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     fields: z.array(z.string()).optional()
       .describe('Explicit field projection from the flattened namespace (level/request_id always kept).'),
     dedupe: z.boolean().optional().describe(
-      'Group repeated messages globally by (level, signature) — timestamps/UUIDs/hex/numbers are normalized away — and render "first_ts..last_ts LEVEL ×N message".',
+      'Group repeated messages within the RETURNED page by (level, signature) — timestamps/UUIDs/hex/numbers are normalized away — rendering "first_ts..last_ts LEVEL ×N message". Raise limit for broader grouping (only fetched rows are grouped). With detail:"raw", each group keeps one verbatim _raw exemplar.',
     ),
     maxMessageChars: z.number().int().min(100).optional()
       .describe(`Safety cap for the message field (default ${config.maxMessageChars}); the message is never truncated by default.`),
@@ -187,20 +287,70 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
   };
 
   /**
-   * Summary support: one extra `count by levelname` aggregate job for an EXACT whole-job
-   * level breakdown (the fetched page is only a sample). Returns undefined on any failure
-   * or partial wait — the summary then falls back to a clearly-labeled sample count.
+   * In-process detection memoization (§3, O1): positive detections only, short TTL,
+   * LRU-capped. Dies with the process — no files in Phase 1.
+   */
+  const detectionCache = new DetectionCache();
+  const detectDeps = (
+    input: { timeZone?: string; byReceiptTime?: boolean },
+    signal: AbortSignal | undefined,
+  ) => ({
+    api,
+    timeZone: input.timeZone ?? config.defaultTimeZone,
+    byReceiptTime: input.byReceiptTime,
+    signal,
+    cache: detectionCache,
+  });
+
+  interface ExactLevelResult {
+    counts: Record<string, number>;
+    /** Disclosed provenance, e.g. "log.severity". */
+    provenance: string;
+  }
+
+  /**
+   * Summary support (§6): detection picks the scope's severity field, then one extra
+   * `count by <field>` aggregate yields EXACT whole-job counts (the fetched page is only
+   * a sample). Returns undefined on any failure/no-signal — the summary then falls back
+   * to a LOUDLY-labeled sample count. Best-effort by contract: never throws.
    */
   const fetchExactLevelCounts = async (
     input: { query: string; timeZone?: string; byReceiptTime?: boolean },
     range: { from: string | number; to: string | number },
     signal?: AbortSignal,
-  ): Promise<Record<string, number> | undefined> => {
+  ): Promise<ExactLevelResult | undefined> => {
     let aggId: string | undefined;
     try {
+      const det = await detectSchema(detectDeps(input, signal), input.query, range);
+      if (!det.primary) return undefined; // no-signal: keep the sample fallback
+      let clause: string;
+      let alias: string;
+      let provenance: string;
+      let mapKey: (v: string) => string;
+      switch (det.primary.family) {
+        case 'word': {
+          const field = det.primary.field!;
+          clause = ` | json field=_raw "${field}" as yz_lvl nodrop`;
+          alias = 'yz_lvl';
+          provenance = field;
+          mapKey = (v) => normalizeLevel(v) ?? 'UNKNOWN';
+          break;
+        }
+        case 'numeric':
+          clause = ' | json field=_raw "log.severity" as yz_sev nodrop';
+          alias = 'yz_sev';
+          provenance = 'log.severity';
+          mapKey = (v) => (v === '' ? '(none)' : coerceNumericDisplay(v));
+          break;
+        default:
+          clause = TOKEN_CLASS_CLAUSE;
+          alias = 'yz_tok';
+          provenance = 'string token class';
+          mapKey = (v) => (v === '' ? '(none)' : v);
+      }
       const created = await api.create(
         {
-          query: `${input.query} | json field=_raw "${config.levelExpr}" as levelname nodrop | count by levelname`,
+          query: `${input.query}${clause} | count by ${alias}`,
           from: range.from,
           to: range.to,
           timeZone: input.timeZone ?? config.defaultTimeZone,
@@ -214,10 +364,10 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
       const page = await api.records(aggId, 0, 100, signal);
       const counts: Record<string, number> = {};
       for (const r of page.records ?? []) {
-        const lvl = normalizeLevel(r.map['levelname']) ?? 'UNKNOWN';
-        counts[lvl] = (counts[lvl] ?? 0) + Number(r.map['_count'] ?? 0);
+        const key = mapKey(r.map[alias] ?? '');
+        counts[key] = (counts[key] ?? 0) + Number(r.map['_count'] ?? 0);
       }
-      return counts;
+      return { counts, provenance };
     } catch {
       return undefined;
     } finally {
@@ -292,9 +442,9 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
             const rows = sortRowsByMessageTime(page.messages ?? [], input.sort ?? 'asc');
             const opts = fmtOpts(input);
             if (opts.detail === 'summary') {
-              opts.exactLevelCounts = exactLevelCountsPromise
-                ? await exactLevelCountsPromise
-                : undefined;
+              const exact = exactLevelCountsPromise ? await exactLevelCountsPromise : undefined;
+              opts.exactLevelCounts = exact?.counts;
+              opts.exactLevelProvenance = exact?.provenance;
             }
             body = formatMessages(rows, opts, status);
             resultCount = rows.length;
@@ -649,7 +799,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     {
       title: 'Facet a query across dimensions (ranked top-N counts)',
       description:
-        `The fastest way to see the SHAPE of matching logs before reading any messages: runs one small "count by <dimension>" aggregate per dimension (concurrently; every job auto-deleted) and returns a compact ranked table per dimension. Dimensions starting with "_" are native Sumo fields (e.g. _sourcecategory, _sourcehost); anything else is parsed from the JSON payload as log.<dimension> (e.g. levelname, status, path). One failing dimension yields an error line, never a total failure. ${timeRangeDoc}${sourceCategoryHint}`,
+        `The fastest way to see the SHAPE of matching logs before reading any messages: runs one small "count by <dimension>" aggregate per dimension (concurrently; every job auto-deleted) and returns a compact ranked table per dimension. Dimensions starting with "_" are native Sumo fields (e.g. _sourcecategory, _sourcehost); anything else is an ABSOLUTE JSON path from the _raw root (e.g. stream, log.levelname, log.status — dots allowed). A dimension that is 100% (none) probably does not exist at that path — run sumo_describe_schema to learn the scope's real fields. Numeric keys match numerically when filtering (num(x) = 404) — some producers emit float-strings like "404.0" (displayed coerced). One failing dimension yields an error line, never a total failure. ${timeRangeDoc}${sourceCategoryHint}`,
       inputSchema: {
         query: z.string().min(1)
           .describe('Sumo Logic scope query (keywords + metadata filters). Scope only — no | operators; each dimension appends its own "| count by".'),
@@ -672,10 +822,21 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
           dims.map(async (dim): Promise<FacetDimensionResult> => {
             let facetJobId: string | undefined;
             try {
+              if (!DIM_RE.test(dim)) {
+                return {
+                  dimension: dim,
+                  error:
+                    'invalid dimension — use a "_"-prefixed native field or an absolute JSON path from the _raw root (letters/digits/underscores, dots between segments).',
+                };
+              }
+              // Non-"_" dims are ABSOLUTE paths from the _raw root (§10): `stream` reaches
+              // the top-level envelope key; `log.levelname` the nested field. The alias is
+              // the path with dots→underscores.
+              const alias = dim.startsWith('_') ? dim : dim.replace(/\./g, '_');
               // `sort by _count` (desc) BEFORE limit — otherwise limit truncates unranked.
               const facetQuery = dim.startsWith('_')
                 ? `${input.query} | count by ${dim} | sort by _count | limit ${limit}`
-                : `${input.query} | json field=_raw "log.${dim}" as ${dim} nodrop | count by ${dim} | sort by _count | limit ${limit}`;
+                : `${input.query} | json field=_raw "${dim}" as ${alias} nodrop | count by ${alias} | sort by _count | limit ${limit}`;
               const created = await api.create(
                 {
                   query: facetQuery,
@@ -692,8 +853,9 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
                 onProgress: report ? (p) => report(`${dim}: ${p.state}`) : undefined,
               });
               const page = await api.records(facetJobId, 0, limit, extra.signal);
+              const alias2 = dim.startsWith('_') ? dim : dim.replace(/\./g, '_');
               const rows = (page.records ?? []).map((r) => ({
-                key: r.map[dim] ?? '',
+                key: r.map[alias2] ?? '',
                 // _count arrives as a STRING — parse for numeric alignment.
                 count: Number.parseInt(r.map['_count'] ?? '0', 10) || 0,
               }));
@@ -736,15 +898,15 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
   server.registerTool(
     'sumo_error_digest',
     {
-      title: 'Deduplicated error/warning digest for a scope',
+      title: 'Deduplicated error/warning digest for a scope (auto-detected severity)',
       description:
-        `One-call triage: finds ERROR/WARNING (configurable via levels) messages in scope, groups them by normalized signature (timestamps/UUIDs/hex/numbers stripped), and returns the top-N distinct problems with count, first/last occurrence, a sample request_id for cross-referencing, and the _sourcecategory. Level filter uses ${config.levelExpr} parsed from _raw (reliable), never _loglevel. ${timeRangeDoc}${sourceCategoryHint}`,
+        `One-call triage: finds the scope's severity-signal messages, groups them by normalized signature (timestamps/UUIDs/hex/numbers stripped), and returns the top-N distinct problems with count, first/last occurrence, a sample request_id for cross-referencing, and the _sourcecategory. The severity filter is AUTO-DETECTED per scope (severity schemas VARY per system) and DISCLOSED in the output with a matched-N-of-M line — override with filter=; run sumo_describe_schema on a new/odd scope for paste-ready fragments. Cost: 2 search jobs (3 when string-payload categories are in scope; 1 with filter=), all auto-deleted. ${timeRangeDoc}${sourceCategoryHint}`,
       inputSchema: {
         query: z.string().min(1).optional()
-          .describe(`Base scope query (default: _sourcecategory=${config.defaultSourceCategory ?? '<SUMO_DEFAULT_SOURCE_CATEGORY — not set>'}). Scope by _sourcecategory, NOT by a hostname keyword — errors/exceptions carry no hostname and would be silently excluded. The level filter is appended automatically — do not add | operators.`),
+          .describe(`Base scope query (default: _sourcecategory=${config.defaultSourceCategory ?? '<SUMO_DEFAULT_SOURCE_CATEGORY — not set>'}). Scope by _sourcecategory, NOT by a hostname keyword — errors/exceptions carry no hostname and would be silently excluded. The severity filter is appended automatically — do not add | operators.`),
         ...timeRangeShape,
-        levels: z.array(z.string().min(1)).min(1).optional()
-          .describe('Levels to include (default ["ERROR","WARNING"]).'),
+        filter: z.string().min(1).optional()
+          .describe('Optional raw Sumo fragment appended verbatim after the scope: keyword/paren terms (e.g. ("[error]" OR "[crit]")) or an operator chain starting with | (e.g. | json field=_raw "log.severity" as s nodrop | where num(s)>=3 or s="Fatal"). Supplying filter SKIPS auto-detection (exactly 1 search job) and is disclosed as agent-supplied. sumo_describe_schema proposes paste-ready fragments.'),
         limit: z.number().int().min(1).max(200).optional()
           .describe('Top-N signatures to return (default 20).'),
         maxScan: z.number().int().min(1).max(MAX_TOTAL_MESSAGES).optional()
@@ -768,11 +930,41 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
             ),
           );
         }
-        const levels = input.levels ?? ['ERROR', 'WARNING'];
-        const quoted = levels.map((l) => `"${l.replace(/"/g, '')}"`).join(',');
-        const query = `${base} | json field=_raw "${config.levelExpr}" as levelname nodrop | where levelname in (${quoted})`;
+        const range = resolveRange(input, now);
+        const agentFilter = input.filter?.trim();
 
-        const { created, range } = await createJob({ ...input, query }, extra.signal);
+        // Default flow (§4.2): detect, apply, disclose. filter= skips detection entirely.
+        let det: Detection | undefined;
+        let query: string;
+        let usesNum = false;
+        if (agentFilter !== undefined && agentFilter !== '') {
+          query = appendFilter(base, agentFilter);
+        } else {
+          report?.('detecting severity schema');
+          det = await detectSchema(detectDeps(input, extra.signal), base, range);
+          if (det.predicate === undefined && det.scopeTotal === 0) {
+            // Empty scope: a severity result would be a lie — say what this actually is.
+            return ok(
+              [
+                'scope is EMPTY in this range: 0 messages matched the scope (a scope/range result, NOT "no errors").',
+                'Check the range and the _sourcecategory spelling; consider byReceiptTime: true for recent windows.',
+              ].join('\n'),
+            );
+          }
+          query = det.predicate !== undefined ? `${base}${det.predicate}` : base; // §4.5: unfiltered fallback
+          usesNum = det.usesNum;
+        }
+
+        const created = await api.create(
+          {
+            query,
+            from: range.from,
+            to: range.to,
+            timeZone: input.timeZone ?? config.defaultTimeZone,
+            byReceiptTime: input.byReceiptTime,
+          },
+          extra.signal,
+        );
         jobId = created.id;
         const wait = await waitForCompletion(api, jobId, {
           signal: extra.signal,
@@ -780,6 +972,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
             ? (p) => report(`${p.state} messageCount=${p.messageCount}`)
             : undefined,
         });
+        const matched = wait.status.messageCount ?? 0;
 
         const maxScan = Math.min(input.maxScan ?? 5000, MAX_TOTAL_MESSAGES);
         const groups = new Map<string, DigestGroup>();
@@ -795,23 +988,57 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
           },
         });
 
-        const body = renderDigest(
-          {
-            scanned: res.collected,
-            levels,
-            topN: input.limit ?? 20,
-            truncated: res.truncated || wait.truncated,
-          },
-          groups,
-        );
+        // Disclosure block (§4.3) — every digest response carries one; no silent filtering.
+        let disclosure: string;
+        if (agentFilter !== undefined && agentFilter !== '') {
+          disclosure = [
+            `severity filter (agent-supplied): ${agentFilter}`,
+            `  matched: ${nUS(matched)} messages (scope total not measured in filter= mode)`,
+          ].join('\n');
+        } else if (det!.predicate !== undefined) {
+          disclosure = detectionDisclosure(det!, matched);
+        } else {
+          disclosure = noSignalDisclosure(det!.scopeTotal);
+        }
+
+        // Zero-match guardrail (§4.4): a filtered zero on a non-empty scope is never a bare
+        // "(no matching messages)" — CALM when detection was confident (high field fill:
+        // the scope is genuinely clean), LOUD when it was not (possible schema mismatch).
+        let body: string;
+        const filterApplied = (agentFilter !== undefined && agentFilter !== '') || det?.predicate !== undefined;
+        if (matched === 0 && filterApplied) {
+          if (det !== undefined) {
+            const conf = confidentZeroFill(det);
+            if (conf !== undefined) {
+              body = calmZeroBlock(conf, det.scopeTotal);
+            } else {
+              const mLabel =
+                det.cachedAgeMs !== undefined
+                  ? `${nUS(det.scopeTotal)} messages at detection time, ${formatAge(det.cachedAgeMs)} ago (cached)`
+                  : `${nUS(det.scopeTotal)} messages in range`;
+              body = zeroMatchBlock(mLabel);
+            }
+          } else {
+            body = ZERO_MATCH_UNKNOWN_M;
+          }
+        } else {
+          body = renderDigest(
+            {
+              scanned: res.collected,
+              topN: input.limit ?? 20,
+              truncated: res.truncated || wait.truncated,
+            },
+            groups,
+          );
+        }
 
         const notes: string[] = [];
         if (wait.partial) notes.push('PARTIAL: wait timed out before completion — digest covers what was gathered so far.');
-        const warns = realWarnings(wait.status);
+        const warns = annotateNumWarnings(realWarnings(wait.status), usesNum);
         if (warns.length > 0) notes.push(`warnings: ${warns.join(' | ')}`);
         const link = buildDeepLink(config.uiBaseUrl, query, range.fromMs, range.toMs);
         if (link) notes.push(`open in Sumo UI: ${link}`);
-        return ok([body, ...notes].join('\n'));
+        return ok([disclosure, '', body, ...notes].join('\n'));
       } catch (err) {
         return fail(err);
       } finally {
@@ -890,6 +1117,19 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
           extra.signal,
         );
         jobId = created.id;
+
+        // §6: summary polls get the SAME detection-driven exact side-aggregate as
+        // run_search (concurrent with the main wait). Compact polls stay 1 job.
+        const detail = input.detail ?? config.defaultDetail;
+        const exactLevelCountsPromise =
+          detail === 'summary'
+            ? fetchExactLevelCounts(
+                { query: input.query, timeZone: config.defaultTimeZone, byReceiptTime: true },
+                { from, to },
+                extra.signal,
+              )
+            : undefined;
+
         const wait = await waitForCompletion(api, jobId, {
           signal: extra.signal,
           onProgress: report
@@ -904,7 +1144,13 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
         if ((status.messageCount ?? 0) > 0) {
           const page = await api.messages(jobId, 0, limit, extra.signal);
           const rows = sortRowsByMessageTime(page.messages ?? [], input.sort ?? 'asc');
-          body = formatMessages(rows, fmtOpts(input), status);
+          const opts = fmtOpts(input);
+          if (opts.detail === 'summary') {
+            const exact = exactLevelCountsPromise ? await exactLevelCountsPromise : undefined;
+            opts.exactLevelCounts = exact?.counts;
+            opts.exactLevelProvenance = exact?.provenance;
+          }
+          body = formatMessages(rows, opts, status);
           shown = rows.length;
         }
 
@@ -942,7 +1188,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     {
       title: 'Timeslice trend: counts over time per series (sparklines)',
       description:
-        `Shows WHEN things happened: buckets matching messages with | timeslice, counts per bucket split into series (default: log level via ${config.levelExpr}), and renders one compact sparkline + per-bucket counts per series. Use it to spot spikes and onsets before reading messages. The query must be a plain scope — no | aggregation operators (timeslice/count are appended; one search job, auto-deleted). ${timeRangeDoc}${sourceCategoryHint}`,
+        `Shows WHEN things happened: buckets matching messages with | timeslice, counts per bucket split into series (default: the scope's AUTO-DETECTED severity field, disclosed in the output), and renders one compact sparkline + per-bucket counts per series. Use it to spot spikes and onsets before reading messages. The query must be a plain scope — no | aggregation operators (timeslice/count are appended; jobs auto-deleted). ${timeRangeDoc}${sourceCategoryHint}`,
       inputSchema: {
         query: z.string().min(1)
           .describe('Sumo Logic scope query (keywords + metadata filters; no | aggregation operators).'),
@@ -951,7 +1197,10 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
           'Bucket size, e.g. "30s", "5m", "1h" (units s/m/h/d). Default: auto — the smallest nice step giving ≤40 buckets over the window.',
         ),
         by: z.string().optional().describe(
-          `Series dimension (default "levelname", parsed from ${config.levelExpr}). "_"-prefixed = native Sumo field (e.g. _sourcecategory); "none" = one total series; anything else parses log.<by> from the JSON payload.`,
+          'Series dimension. "_"-prefixed = native Sumo field (e.g. _sourcecategory); "none" = one total series; anything else is an ABSOLUTE JSON path from the _raw root (dots allowed — e.g. stream, log.levelname). Omitted: the scope\'s auto-detected severity field (disclosed).',
+        ),
+        filter: z.string().min(1).optional().describe(
+          'Optional raw Sumo fragment applied between the scope and the timeslice (same contract as sumo_error_digest\'s filter=) — e.g. trend ONLY the errors using a fragment sumo_describe_schema proposed. With filter= AND an explicit by=, no detection runs (exactly 1 job).',
         ),
         maxSeries: z.number().int().min(1).max(20).optional()
           .describe('Max series rendered, ranked by total count (default 8; the rest merge into "(other)").'),
@@ -968,28 +1217,84 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
             ),
           );
         }
-        const by = input.by ?? 'levelname';
-        if (by !== 'none' && !/^_?[A-Za-z][A-Za-z0-9_]*$/.test(by)) {
-          return fail(
-            new Error(`Invalid series dimension "${by}" — use a simple identifier, a "_"-prefixed native field, or "none".`),
-          );
-        }
         const report = progressReporter(extra);
         const range = resolveRange(input, now);
         const windowMs =
           range.fromMs !== undefined && range.toMs !== undefined ? range.toMs - range.fromMs : undefined;
         const intervalLabel = input.interval?.trim() || pickTrendInterval(windowMs);
         const intervalMs = parseLast(intervalLabel); // also validates an explicit interval
+        const agentFilter = input.filter?.trim();
 
-        let query: string;
-        if (by === 'none') {
-          query = `${input.query} | timeslice ${intervalLabel} | count by _timeslice`;
-        } else if (by.startsWith('_')) {
-          query = `${input.query} | timeslice ${intervalLabel} | count by _timeslice, ${by}`;
+        // Series selection: explicit `by` (absolute path / native / none), or detection.
+        let det: Detection | undefined;
+        let seriesClause = '';
+        let alias: string | undefined; // record column carrying the series key
+        let byLabel: string;
+        let normalizeAsLevel = false;
+        const disclosures: string[] = [];
+
+        if (input.by !== undefined) {
+          const by = input.by;
+          if (by === 'none') {
+            byLabel = 'none';
+          } else if (!DIM_RE.test(by)) {
+            return fail(
+              new Error(
+                `Invalid series dimension "${by}" — use a "_"-prefixed native field, "none", or an absolute JSON path from the _raw root (dots allowed).`,
+              ),
+            );
+          } else if (by.startsWith('_')) {
+            alias = by;
+            byLabel = by;
+          } else {
+            alias = by.replace(/\./g, '_');
+            seriesClause = ` | json field=_raw "${by}" as ${alias} nodrop`;
+            byLabel = by;
+          }
         } else {
-          const path = by === 'levelname' ? config.levelExpr : `log.${by}`;
-          query = `${input.query} | json field=_raw "${path}" as ${by} nodrop | timeslice ${intervalLabel} | count by _timeslice, ${by}`;
+          report?.('detecting severity schema');
+          det = await detectSchema(detectDeps(input, extra.signal), input.query, range);
+          const cachedSuffix =
+            det.cachedAgeMs !== undefined ? ` (detection cached, ${formatAge(det.cachedAgeMs)})` : '';
+          switch (det.primary?.family) {
+            case 'word': {
+              const field = det.primary.field!;
+              alias = 'yz_lvl';
+              seriesClause = ` | json field=_raw "${field}" as yz_lvl nodrop`;
+              byLabel = field;
+              normalizeAsLevel = true;
+              disclosures.push(
+                `series (auto-detected): ${field} — word-level family; syntax only, semantics unverified. Override with by= / filter=.${cachedSuffix}`,
+              );
+              break;
+            }
+            case 'numeric':
+              alias = 'yz_sev';
+              seriesClause = ' | json field=_raw "log.severity" as yz_sev nodrop';
+              byLabel = 'log.severity';
+              disclosures.push(
+                `series (auto-detected): log.severity — numeric family (log.type is a second-choice series); syntax only, semantics unverified. Override with by= / filter=.${cachedSuffix}`,
+              );
+              break;
+            case 'string':
+              alias = 'yz_tok';
+              seriesClause = TOKEN_CLASS_CLAUSE;
+              byLabel = 'token class';
+              disclosures.push(
+                `series (auto-detected): string-token class ([error]/[crit]/[warn]/other) — string-payload family; syntax only, semantics unverified. Override with by= / filter=.${cachedSuffix}`,
+              );
+              break;
+            default:
+              byLabel = 'none';
+              disclosures.push(
+                'series: none — no severity signal detected in this scope (trending the total). Run sumo_describe_schema to learn its fields, then pass by= / filter=.',
+              );
+          }
         }
+
+        const scoped = agentFilter ? appendFilter(input.query, agentFilter) : input.query;
+        const countBy = alias !== undefined ? `_timeslice, ${alias}` : '_timeslice';
+        const query = `${scoped}${seriesClause} | timeslice ${intervalLabel} | count by ${countBy}`;
 
         const created = await api.create(
           {
@@ -1019,12 +1324,8 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
           const got = page.records?.length ?? 0;
           if (got === 0) break;
           for (const r of page.records) {
-            const key =
-              by === 'none'
-                ? 'all'
-                : by === 'levelname'
-                  ? (normalizeLevel(r.map[by]) ?? '')
-                  : (r.map[by] ?? '');
+            const rawKey = alias === undefined ? 'all' : (r.map[alias] ?? '');
+            const key = normalizeAsLevel ? (normalizeLevel(rawKey) ?? '') : rawKey;
             rows.push({
               sliceMs: Number(r.map['_timeslice'] ?? 0),
               key,
@@ -1037,17 +1338,31 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
 
         const fmtBound = (label: string | number, ms: number | undefined) =>
           ms !== undefined ? new Date(ms).toISOString() : String(label);
-        const body = renderTrend(
-          {
-            fromLabel: fmtBound(range.from, range.fromMs),
-            toLabel: fmtBound(range.to, range.toMs),
-            intervalLabel,
-            intervalMs,
-            by,
-            maxSeries: input.maxSeries ?? 8,
-          },
-          rows,
-        );
+
+        // Zero-data guardrail (§5.1): a filtered/detected trend with zero rows on a
+        // non-empty scope must never render as a quiet "nothing happened".
+        let body: string;
+        if (rows.length === 0 && det !== undefined && det.predicate !== undefined && det.scopeTotal > 0) {
+          const mLabel =
+            det.cachedAgeMs !== undefined
+              ? `${nUS(det.scopeTotal)} messages at detection time, ${formatAge(det.cachedAgeMs)} ago (cached)`
+              : `${nUS(det.scopeTotal)} messages in range`;
+          body = zeroMatchBlock(mLabel).replace('ZERO MATCHES from the severity filter', 'ZERO DATA POINTS from the trend series/filter');
+        } else if (rows.length === 0 && agentFilter) {
+          body = ZERO_MATCH_UNKNOWN_M.replace('ZERO MATCHES from the severity filter', 'ZERO DATA POINTS from the trend filter');
+        } else {
+          body = renderTrend(
+            {
+              fromLabel: fmtBound(range.from, range.fromMs),
+              toLabel: fmtBound(range.to, range.toMs),
+              intervalLabel,
+              intervalMs,
+              by: byLabel,
+              maxSeries: input.maxSeries ?? 8,
+            },
+            rows,
+          );
+        }
 
         const notes: string[] = [];
         if (wait.truncated) notes.push('TRUNCATED: the scan hit the 100k message cap (FORCE PAUSED) — counts cover the scanned prefix.');
@@ -1056,7 +1371,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
         if (warns.length > 0) notes.push(`warnings: ${warns.join(' | ')}`);
         const link = buildDeepLink(config.uiBaseUrl, query, range.fromMs, range.toMs);
         if (link) notes.push(`open in Sumo UI: ${link}`);
-        return ok([body, ...notes].join('\n'));
+        return ok([...disclosures, body, ...notes].join('\n'));
       } catch (err) {
         return fail(err);
       } finally {
@@ -1067,26 +1382,78 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
   );
 
   // ------------------------------------------------------------- sumo_list_monitors
+  const MONITOR_STATUSES = ['Critical', 'Warning', 'MissingData', 'Normal', 'Disabled'] as const;
   server.registerTool(
     'sumo_list_monitors',
     {
       title: 'List Sumo Logic Monitors (native alerting; read-only)',
       description:
-        'Discovers the org\'s native Sumo Logic Monitors (the 24/7 prod alerting): name, folder path, type, enabled/disabled, current status, trigger types, and notification destinations. Read-only management-API call — no search jobs involved. Requires an access key with the "View Monitors" capability (without it Sumo returns HTTP 403). Optional query filters by monitor name/content.',
+        'Discovers the org\'s native Sumo Logic Monitors (the 24/7 prod alerting): name, folder path, type, enabled/disabled, current status, trigger types, and notification destinations. Read-only management-API call — no search jobs involved. Requires an access key with the "View Monitors" capability (without it Sumo returns HTTP 403). FOOTGUN: free-text `query` matching is NAME-ONLY, case-insensitive substring — folder paths are NOT searched (a folder name yields 0 even when monitors live under it). The query syntax also accepts monitorStatus:<Critical|Warning|MissingData|Normal|Disabled> (what the `status` param wraps). Fired-alert HISTORY is a different question — use sumo_list_alerts.',
       inputSchema: {
         query: z.string().min(1).optional()
-          .describe('Filter text (Sumo monitors-search syntax; matched against monitor names/content).'),
+          .describe('Filter text (Sumo monitors-search syntax). Matching is NAME-ONLY case-insensitive substring — folder paths are not searched.'),
+        status: z.array(z.enum(MONITOR_STATUSES)).min(1).optional()
+          .describe('Filter by current monitor status. The API has NO OR support — multiple statuses run one API call each, unioned client-side by monitor id.'),
         limit: z.number().int().min(1).max(1000).optional()
-          .describe('Max monitors returned (default 100).'),
+          .describe('Max monitors returned per API call (default 100).'),
       },
       annotations: READ_ONLY_ANNOTATIONS,
     },
     async (input, extra): Promise<ToolResult> => {
       try {
-        const q = input.query ? `type:monitor ${input.query}` : 'type:monitor';
-        const hits = await monitors.search(q, input.limit ?? 100, extra.signal);
-        if (hits.length === 0) return ok('No monitors matched.');
-        const lines = [`monitors: ${hits.length}`];
+        const limit = input.limit ?? 100;
+        const statuses = input.status ?? [];
+        const buildQuery = (status?: string) =>
+          ['type:monitor', status !== undefined ? `monitorStatus:${status}` : undefined, input.query]
+            .filter((p): p is string => p !== undefined)
+            .join(' ');
+
+        let hits: MonitorSearchHit[];
+        if (statuses.length === 0) {
+          hits = await monitors.search(buildQuery(), limit, extra.signal);
+        } else {
+          // No OR support in the API (live-verified: "monitorStatus:Critical OR
+          // monitorStatus:Warning" returns 0) — one call per status, unioned by id.
+          const results = await Promise.all(
+            statuses.map((s) => monitors.search(buildQuery(s), limit, extra.signal)),
+          );
+          const seen = new Map<string, MonitorSearchHit>();
+          for (const h of results.flat()) {
+            const key = h.item?.id ?? `${h.path ?? ''}/${h.item?.name ?? ''}`;
+            if (!seen.has(key)) seen.set(key, h);
+          }
+          hits = [...seen.values()];
+        }
+
+        const filtered = input.query !== undefined || statuses.length > 0;
+        let total: number | undefined;
+        if (filtered) {
+          // One unfiltered call for the denominator (best-effort — header degrades to "?").
+          total = await monitors
+            .search('type:monitor', 1000, extra.signal)
+            .then((all) => all.length)
+            .catch(() => undefined);
+        }
+
+        const statusCount = (s: string) =>
+          hits.filter((h) => !h.item?.isDisabled && (h.item?.status ?? []).includes(s)).length;
+        const disabled = hits.filter((h) => h.item?.isDisabled === true).length;
+        const summary = `${statusCount('Critical')} Critical, ${statusCount('Warning')} Warning, ${disabled} disabled`;
+
+        if (hits.length === 0) {
+          if (filtered) {
+            return ok(
+              `monitors: 0${total !== undefined ? `/${total}` : ''} matched (${total ?? '?'} exist unfiltered; matching is name-only, case-insensitive substring — folder paths are NOT searched). Try a shorter name fragment, drop the status filter, or call with no query.`,
+            );
+          }
+          return ok('No monitors matched.');
+        }
+
+        const lines = [
+          filtered
+            ? `monitors: ${hits.length}/${total ?? '?'} matched — ${summary}`
+            : `monitors: ${hits.length} — ${summary}`,
+        ];
         for (const h of hits) {
           const m = h.item ?? {};
           const state = m.isDisabled ? 'DISABLED' : (m.status ?? []).join(',') || '?';
@@ -1112,6 +1479,166 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
             ),
           );
         }
+        return fail(err);
+      }
+    },
+  );
+
+  // --------------------------------------------------------------- sumo_list_alerts
+  server.registerTool(
+    'sumo_list_alerts',
+    {
+      title: 'List fired alerts (history) from the System Event Index',
+      description:
+        `Fired-alert HISTORY — the complement to sumo_list_monitors (definitions + current state): queries the documented System Event Index (${ALERTS_INDEX_SCOPE}) through the standard Search Job API. The index is enabled and searchable by default on Enterprise accounts (the same tier the Search Job API already requires). Alert create and resolve are SEPARATE events — this tool correlates them into one line per fired alert: fired-at, resolved-at (when the resolve event is in range), latest trigger status, and the monitorId + monitor name JOIN KEYS back to sumo_list_monitors. One search job, auto-deleted. ${timeRangeDoc}`,
+      inputSchema: {
+        ...timeRangeShape,
+        monitorQuery: z.string().min(1).optional()
+          .describe('Keyword filter (e.g. a monitor-name fragment), matched full-text against the alert event JSON.'),
+        status: z.array(z.string().min(1)).min(1).optional()
+          .describe('Client-side filter on trigger states seen across an alert\'s events (e.g. ["Critical","Warning"]; case-insensitive).'),
+        limit: z.number().int().min(1).max(500).optional()
+          .describe('Max fired alerts returned (default 50).'),
+      },
+      annotations: READ_ONLY_ANNOTATIONS,
+    },
+    async (input, extra): Promise<ToolResult> => {
+      let jobId: string | undefined;
+      try {
+        const report = progressReporter(extra);
+        const range = resolveRange(input, now);
+        const kw = input.monitorQuery?.trim().replace(/"/g, '');
+        // The `_index=` term MUST lead at the top level — nesting it in an OR group
+        // silently matches nothing (live-verified).
+        const query = `${ALERTS_INDEX_SCOPE}${kw ? ` "${kw}"` : ''}`;
+        const created = await api.create(
+          {
+            query,
+            from: range.from,
+            to: range.to,
+            timeZone: input.timeZone ?? config.defaultTimeZone,
+            byReceiptTime: input.byReceiptTime,
+          },
+          extra.signal,
+        );
+        jobId = created.id;
+        const wait = await waitForCompletion(api, jobId, {
+          signal: extra.signal,
+          onProgress: report
+            ? (p) => report(`${p.state} messageCount=${p.messageCount}`)
+            : undefined,
+        });
+
+        const events: AlertEvent[] = [];
+        const res = await collectMessages(api, jobId, {
+          max: 5000,
+          pageSize: 1000,
+          signal: extra.signal,
+          onProgress: report ? (p) => report(`scanned ${p.collected} events`) : undefined,
+          onPage: (page) => {
+            for (const m of page.messages) {
+              const e = parseAlertEvent(m.map);
+              if (e) events.push(e);
+            }
+          },
+        });
+
+        let alerts = correlateAlertEvents(events);
+        if (input.status !== undefined && input.status.length > 0) {
+          const wanted = new Set(input.status.map((s) => s.toLowerCase()));
+          alerts = alerts.filter(
+            (a) =>
+              a.statesSeen.some((s) => wanted.has(s.toLowerCase())) ||
+              (a.lastStatus !== undefined && wanted.has(a.lastStatus.toLowerCase())),
+          );
+        }
+
+        const fmtBound = (label: string | number, ms: number | undefined) =>
+          ms !== undefined ? new Date(ms).toISOString() : String(label);
+        const body = renderAlerts(alerts, {
+          rangeLabel: `${fmtBound(range.from, range.fromMs)} .. ${fmtBound(range.to, range.toMs)}`,
+          scannedEvents: res.collected,
+          limit: input.limit ?? 50,
+          statusFilter: input.status,
+        });
+
+        const notes: string[] = [];
+        if (res.truncated) notes.push('TRUNCATED: event scan capped at 5000 — narrow the range for full coverage.');
+        if (wait.partial) notes.push('PARTIAL: wait timed out before completion — events cover what was gathered so far.');
+        const warns = realWarnings(wait.status);
+        if (warns.length > 0) notes.push(`warnings: ${warns.join(' | ')}`);
+        return ok([body, ...notes].join('\n'));
+      } catch (err) {
+        return fail(err);
+      } finally {
+        // SIGNAL-FREE cleanup (an aborted signal here would leak the job).
+        if (jobId) await api.delete(jobId, { tolerateMissing: true }).catch(() => undefined);
+      }
+    },
+  );
+
+  // ----------------------------------------------------------- sumo_describe_schema
+  server.registerTool(
+    'sumo_describe_schema',
+    {
+      title: "Learn a scope's log schema in depth (propose-only)",
+      description:
+        `Thorough schema learner — the deep counterpart to the lite auto-detection inside sumo_error_digest/sumo_trend: STRATIFIED-samples the scope (per category × type/stream stratum, spread across message shapes — never first-N rows), enumerates top-level AND nested JSON keys (fill %, inferred types incl. float-strings, top values; arrays marked []), characterizes string payloads (format + severity-ish token hits) instead of returning an empty schema, breaks fields out per stratum, and closes with RANKED paste-ready severity fragments for the filter= param — each with honest caveats. It PROPOSES, never decides: it applies no filters and persists nothing; record what you confirm in your own memory. Use when a digest disclosed no-signal/zero-match or on first contact with a new system. Job budget: 2-4 aggregate jobs + 1-6 bounded page jobs, all auto-deleted. ${timeRangeDoc}${sourceCategoryHint}`,
+      inputSchema: {
+        query: z.string().min(1)
+          .describe('Scope query (keywords + metadata filters; no | operators).'),
+        ...timeRangeShape,
+        sampleSize: z.number().int().min(10).max(1000).optional()
+          .describe('Messages sampled for key enumeration (default 200, cap 1000).'),
+        stratifyBy: z.string().min(1).optional()
+          .describe('Explicit stratification field: an absolute JSON path from the _raw root (e.g. log.type, stream). Default: auto-detected (log.type, then stream, then category-only).'),
+        maxDepth: z.number().int().min(1).max(8).optional()
+          .describe('Nested-key flattening depth (default 4); arrays marked [].'),
+      },
+      annotations: READ_ONLY_ANNOTATIONS,
+    },
+    async (input, extra): Promise<ToolResult> => {
+      try {
+        if (isAggregateQuery(input.query)) {
+          return fail(
+            new Error(
+              'sumo_describe_schema needs a plain scope query (it appends its own aggregations). Drop the | operators.',
+            ),
+          );
+        }
+        if (input.stratifyBy !== undefined && !DIM_RE.test(input.stratifyBy)) {
+          return fail(
+            new Error(
+              `Invalid stratifyBy "${input.stratifyBy}" — use an absolute JSON path from the _raw root (dots allowed).`,
+            ),
+          );
+        }
+        const report = progressReporter(extra);
+        const range = resolveRange(input, now);
+        report?.('detecting severity schema');
+        const det = await detectSchema(detectDeps(input, extra.signal), input.query, range);
+        const fmtBound = (label: string | number, ms: number | undefined) =>
+          ms !== undefined ? new Date(ms).toISOString() : String(label);
+        const text = await describeSchema(
+          {
+            api,
+            timeZone: input.timeZone ?? config.defaultTimeZone,
+            byReceiptTime: input.byReceiptTime,
+            signal: extra.signal,
+            onProgress: report,
+          },
+          det,
+          {
+            scope: input.query,
+            range,
+            rangeLabel: `${fmtBound(range.from, range.fromMs)} .. ${fmtBound(range.to, range.toMs)}`,
+            sampleSize: input.sampleSize ?? 200,
+            stratifyBy: input.stratifyBy,
+            maxDepth: input.maxDepth ?? 4,
+          },
+        );
+        return ok(text);
+      } catch (err) {
         return fail(err);
       }
     },

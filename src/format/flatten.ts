@@ -89,6 +89,10 @@ export function flattenMessage(map: Record<string, string>): FlatMessage {
       }
       if (typeof log['message'] === 'string') message = log['message'];
       else if (log['message'] !== undefined) message = str(log['message']);
+    } else if (typeof log === 'string' && log !== '') {
+      // Container-runtime envelope with a plain-string payload (e.g. an nginx line
+      // inside {"stream","timestamp","log"}): the string IS the message.
+      message = log;
     } else if (typeof parsed['message'] === 'string') {
       message = parsed['message'];
     }
@@ -123,6 +127,59 @@ function firstNonEmpty(...vals: (string | undefined)[]): string | undefined {
     if (v !== undefined && v !== '') return v;
   }
   return undefined;
+}
+
+/**
+ * DISPLAY-ONLY float-string coercion (§11.1): some producers emit integral floats
+ * ("404.0", "2.0") — render them as "404"/"2" so keys/levels don't split visually.
+ * Raw/ndjson-export field values stay verbatim; filtering must match numerically
+ * (num(x) = 404), never by string equality.
+ */
+export function coerceNumericDisplay(v: string): string {
+  const m = /^(-?\d+)\.0+$/.exec(v);
+  return m ? m[1]! : v;
+}
+
+/**
+ * Fixed-point rendering for numeric strings (§11.2): "7.15E-4" → "0.000715".
+ * Values that are not E-notation numbers pass through untouched.
+ */
+export function fixedPointNumberDisplay(v: string): string {
+  const m = /^(-?)(\d+)(?:\.(\d+))?[eE]([+-]?\d+)$/.exec(v);
+  if (!m) return v;
+  // String decimal-point shift — no float round-trip, so no precision dross.
+  const [, sign, intPart, fracPart = '', expStr] = m;
+  const digits = intPart! + fracPart;
+  const pointIndex = intPart!.length + Number(expStr);
+  let out: string;
+  if (pointIndex <= 0) out = `0.${'0'.repeat(-pointIndex)}${digits}`;
+  else if (pointIndex >= digits.length) out = digits + '0'.repeat(pointIndex - digits.length);
+  else out = `${digits.slice(0, pointIndex)}.${digits.slice(pointIndex)}`;
+  out = out.replace(/(\.\d*?)0+$/, '$1').replace(/\.$/, '').replace(/^0+(\d)/, '$1');
+  return sign! + out;
+}
+
+/**
+ * Digest level DISPLAY fallback (§4.6): when the standard level chain is empty, show the
+ * best severity-ish signal the message itself carries — numeric/typed fields (`sev=4`,
+ * `Fatal`, `type=exception`) or the matched string token (`[error]`). Pure display +
+ * grouping polish from the fixed detection vocabulary; no schema knowledge added.
+ */
+export function fallbackDigestLevel(flat: FlatMessage): string {
+  if (flat.level) return flat.level;
+  const sev = flat.fields['severity'];
+  if (sev !== undefined && sev !== '') {
+    return /^-?\d+(?:\.\d+)?$/.test(sev) ? `sev=${coerceNumericDisplay(sev)}` : sev;
+  }
+  const type = flat.fields['type'];
+  if (type !== undefined && type !== '') return `type=${type}`;
+  const lower = flat.raw.toLowerCase();
+  if (lower.includes('[error]')) return '[error]';
+  if (lower.includes('[crit]')) return '[crit]';
+  if (lower.includes('[warn')) return '[warn]';
+  if (lower.includes('traceback')) return 'traceback';
+  if (lower.includes('exception')) return 'exception';
+  return 'UNKNOWN';
 }
 
 /** The persistent "enable cookies" body warning is noise on EVERY follow-up response. */

@@ -38,7 +38,7 @@ describe('triage prompt', () => {
     expect(arg!.required).toBeFalsy();
   });
 
-  it('carries the full cookbook (workflow, severity form, tracing, extract) and embeds the problem', async () => {
+  it('carries the schema-neutral cookbook (workflow, severity variance, tracing, extract) and embeds the problem', async () => {
     const client = await setup();
     const res = await client.getPrompt({
       name: 'triage',
@@ -50,9 +50,15 @@ describe('triage prompt', () => {
     expect(txt).toContain('sumo_trend');
     expect(txt).toContain('sumo_error_digest');
     expect(txt).toContain('sumo_export_results');
-    expect(txt).toContain('| json field=_raw "log.levelname" as levelname nodrop');
     expect(txt).toContain('byReceiptTime');
     expect(txt).toMatch(/hostname keyword/i);
+    // §9.3: schema-neutral severity guidance — variance stated, no universal recipe.
+    expect(txt).toContain('schemas VARY per system');
+    expect(txt).toContain('sumo_describe_schema');
+    expect(txt).toContain('matched-N-of-M');
+    expect(txt).toContain('filter=');
+    expect(txt).not.toContain('| json field=_raw "log.levelname" as levelname nodrop'); // the old universal recipe
+    expect(txt).not.toMatch(/stream:"stderr" is NOT/i); // family-A-only claim removed
     // Neutral placeholders only (no org names): the default scope example and the
     // hostname example both come from the reserved example.com namespace.
     expect(txt).toContain('kubernetes/myservice/*/backend');

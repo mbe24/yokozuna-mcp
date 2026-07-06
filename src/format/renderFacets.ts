@@ -1,7 +1,11 @@
+import { coerceNumericDisplay } from './flatten.js';
+
 /**
  * Rendering for sumo_facets: one compact ranked table per dimension. A dimension that
  * failed renders as an error LINE (never fails the whole call); empty-string keys
- * (nodrop rows where the field is absent) render as `(none)`.
+ * (nodrop rows where the field is absent) render as `(none)`. A dimension that is
+ * entirely `(none)` carries an explicit "may not exist at this path" hint (§10.3) —
+ * silence must never read as "the field has no values".
  */
 
 export interface FacetRow {
@@ -49,7 +53,14 @@ export function renderFacets(header: FacetsHeader, results: FacetDimensionResult
     lines.push(`${r.dimension}:${partial}`);
     const width = Math.max(...rows.map((row) => String(row.count).length));
     for (const row of rows) {
-      lines.push(`  ${String(row.count).padStart(width)}  ${row.key === '' ? '(none)' : row.key}`);
+      lines.push(
+        `  ${String(row.count).padStart(width)}  ${row.key === '' ? '(none)' : coerceNumericDisplay(row.key)}`,
+      );
+    }
+    if (rows.every((row) => row.key === '')) {
+      lines.push(
+        '  (100% (none) — the field may not exist at this path in this scope; run sumo_describe_schema)',
+      );
     }
   }
   return lines.join('\n');

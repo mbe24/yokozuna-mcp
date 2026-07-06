@@ -1,7 +1,7 @@
 /**
  * Query-shape heuristics. `isAggregateQuery` detects queries whose results are RECORDS
  * (aggregate) rather than raw messages, by looking for an aggregation/transform operator
- * after a pipe. Used to (a) skip the pointless `count by levelname` side-aggregate in
+ * after a pipe. Used to (a) skip the pointless severity-count side-aggregate in
  * summary mode, and (b) reject aggregate queries in sumo_new_since (which is
  * message-cursor based and meaningless over records).
  */

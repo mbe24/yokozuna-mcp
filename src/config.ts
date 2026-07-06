@@ -33,11 +33,9 @@ export interface Config {
   readonly defaultDetail: DetailLevel;
   readonly defaultLimit: number;
   readonly maxMessageChars: number;
-  /** JSON path (inside `_raw`) of the log level, e.g. `log.levelname`. */
-  readonly levelExpr: string;
   /** sumo_new_since freshness lag (seconds): windows end at now − margin (ingestion settle). */
   readonly settleMarginSeconds: number;
-  /** Default dimensions for sumo_facets. `_`-prefixed = native fields, else `log.<dim>`. */
+  /** Default dimensions for sumo_facets. `_`-prefixed = native fields, else an absolute JSON path from the `_raw` root. */
   readonly facetDimensions: readonly string[];
   /** Whole-response safety cap (chars) for inline tool results. */
   readonly maxResponseChars: number;
@@ -47,13 +45,12 @@ export interface Config {
   readonly keepaliveMaxJobs: number;
 }
 
-export const DEFAULT_FACET_DIMENSIONS = [
-  '_sourcecategory',
-  '_sourcehost',
-  'levelname',
-  'status',
-  'path',
-] as const;
+/**
+ * Native-only defaults (§10.1): payload-schema dims like `levelname` rendered a
+ * misleading `100% (none)` on scopes with other schemas — defaults must assume nothing
+ * about the payload.
+ */
+export const DEFAULT_FACET_DIMENSIONS = ['_sourcecategory', '_sourcehost'] as const;
 
 /** api.sumologic.com for us1, api.<code>.sumologic.com for the rest. */
 export function deploymentToApiBase(dep: Deployment): string {
@@ -69,7 +66,7 @@ export function deploymentToUiBase(dep: Deployment): string {
   return dep === 'us1' ? 'https://service.sumologic.com' : `https://service.${dep}.sumologic.com`;
 }
 
-/** Normalize a UI base URL to its https origin (`https://<host>`), dropping any path/trailing slash. */
+/** Normalize a UI base URL to its https origin (`https://<host>`), removing any path/trailing slash. */
 export function normalizeUiBase(raw: string): string {
   let url: URL;
   try {
@@ -130,6 +127,7 @@ const envSchema = z.object({
   YOKOZUNA_DEFAULT_DETAIL: z.enum(['summary', 'compact', 'full', 'raw']).optional(),
   YOKOZUNA_DEFAULT_LIMIT: z.coerce.number().int().min(1).max(5000).optional(),
   YOKOZUNA_MAX_MESSAGE_CHARS: z.coerce.number().int().min(100).optional(),
+  /** REMOVED in 0.2.0 — kept in the schema only to warn loudly instead of silently ignoring. */
   YOKOZUNA_LEVEL_EXPR: z.string().min(1).optional(),
   YOKOZUNA_SETTLE_MARGIN_SECONDS: z.coerce.number().int().min(0).optional(),
   YOKOZUNA_FACET_DIMENSIONS: z.string().min(1).optional(),
@@ -146,7 +144,10 @@ function parseFacetDimensions(raw: string | undefined): string[] {
   return dims.length > 0 ? dims : [...DEFAULT_FACET_DIMENSIONS];
 }
 
-export function loadConfig(env: Record<string, string | undefined> = process.env): Config {
+export function loadConfig(
+  env: Record<string, string | undefined> = process.env,
+  onWarning: (message: string) => void = (m) => console.error(m),
+): Config {
   const parsed = envSchema.safeParse(env);
   if (!parsed.success) {
     const details = parsed.error.issues
@@ -183,6 +184,14 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
       ? deploymentToUiBase(deployment)
       : undefined;
 
+  if (e.YOKOZUNA_LEVEL_EXPR !== undefined) {
+    onWarning(
+      '[yokozuna-mcp] YOKOZUNA_LEVEL_EXPR was removed in 0.2.0 — severity is auto-detected ' +
+        'per scope (disclosed in tool output); use the per-call filter= parameter for ' +
+        'overrides. The variable is ignored.',
+    );
+  }
+
   return Object.freeze({
     accessId: e.SUMO_ACCESS_ID!,
     accessKey: e.SUMO_ACCESS_KEY!,
@@ -195,7 +204,6 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     defaultDetail: e.YOKOZUNA_DEFAULT_DETAIL ?? 'compact',
     defaultLimit: e.YOKOZUNA_DEFAULT_LIMIT ?? 100,
     maxMessageChars: e.YOKOZUNA_MAX_MESSAGE_CHARS ?? 10_000,
-    levelExpr: e.YOKOZUNA_LEVEL_EXPR ?? 'log.levelname',
     settleMarginSeconds: e.YOKOZUNA_SETTLE_MARGIN_SECONDS ?? 180,
     facetDimensions: Object.freeze(parseFacetDimensions(e.YOKOZUNA_FACET_DIMENSIONS)),
     maxResponseChars: e.YOKOZUNA_MAX_RESPONSE_CHARS ?? 200_000,

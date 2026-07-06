@@ -1,4 +1,4 @@
-import { epochMsToIso } from './flatten.js';
+import { epochMsToIso, fallbackDigestLevel } from './flatten.js';
 import { signature } from './formatMessages.js';
 import type { FlatMessage } from './flatten.js';
 
@@ -21,13 +21,18 @@ export interface DigestGroup {
   sourceCategory: string | undefined;
 }
 
-/** Fold one flattened message into the group map (streaming: no message accumulation). */
+/**
+ * Fold one flattened message into the group map (streaming: no message accumulation).
+ * The level column falls back to the message's own severity-ish signal (`sev=4`, `Fatal`,
+ * `type=exception`, `[error]`) when the standard level chain is empty (§4.6); the
+ * grouping key follows the displayed level.
+ */
 export function accumulateDigest(
   groups: Map<string, DigestGroup>,
   flat: FlatMessage,
   messageTimeMs: number,
 ): void {
-  const level = flat.level ?? 'UNKNOWN';
+  const level = fallbackDigestLevel(flat);
   const key = `${level} ${signature(flat.message)}`;
   const g = groups.get(key);
   if (!g) {
@@ -55,7 +60,6 @@ const MAX_DIGEST_MESSAGE_CHARS = 300;
 
 export interface DigestHeader {
   scanned: number;
-  levels: string[];
   topN: number;
   /** The scan stopped at maxScan / the 100k cap — counts cover the scanned prefix only. */
   truncated: boolean;
@@ -65,7 +69,7 @@ export function renderDigest(header: DigestHeader, groups: Map<string, DigestGro
   const iso = (ms: number) => epochMsToIso(String(ms)) ?? '?';
   const lines: string[] = [];
   lines.push(
-    `error digest (${header.levels.join('/')}): scanned ${header.scanned} messages, ` +
+    `error digest: scanned ${header.scanned} messages, ` +
       `${groups.size} distinct signatures — top ${Math.min(header.topN, groups.size)}` +
       (header.truncated
         ? ' [TRUNCATED: scan cap hit — counts cover the scanned messages only; raise maxScan or narrow the range]'
@@ -78,7 +82,9 @@ export function renderDigest(header: DigestHeader, groups: Map<string, DigestGro
         ? `${g.message.slice(0, MAX_DIGEST_MESSAGE_CHARS)}…`
         : g.message;
     const parts = [`×${g.count}`, g.level, `${iso(g.firstMs)}..${iso(g.lastMs)}`];
-    if (g.requestId) parts.push(`req=${g.requestId}`);
+    // req is the promised cross-ref handle — make its absence explicit (some scopes,
+    // e.g. workers, carry no request ids at all).
+    parts.push(`req=${g.requestId ?? '—'}`);
     if (g.sourceCategory) parts.push(`[${g.sourceCategory}]`);
     parts.push(msg);
     lines.push(parts.join(' '));

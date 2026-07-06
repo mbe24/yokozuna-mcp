@@ -1,5 +1,14 @@
 import { describe, expect, it } from 'vitest';
-import { flattenMessage, isCookieNoiseWarning, normalizeLevel } from '../src/format/flatten.js';
+import {
+  coerceNumericDisplay,
+  fallbackDigestLevel,
+  fixedPointNumberDisplay,
+  flattenMessage,
+  isCookieNoiseWarning,
+  normalizeLevel,
+} from '../src/format/flatten.js';
+import { accumulateDigest, renderDigest, type DigestGroup } from '../src/format/renderDigest.js';
+import { renderFacets } from '../src/format/renderFacets.js';
 import { formatMessages, signature, sortRowsByMessageTime } from '../src/format/formatMessages.js';
 import { formatRecords } from '../src/format/formatRecords.js';
 import type { ResultRow, SearchJobStatus } from '../src/sumo/types.js';
@@ -394,6 +403,147 @@ describe('capResponseText', () => {
   });
 });
 
+describe('display coercions (§11)', () => {
+  it('coerceNumericDisplay renders integral float-strings as integers, display-only', () => {
+    expect(coerceNumericDisplay('404.0')).toBe('404');
+    expect(coerceNumericDisplay('2.000')).toBe('2');
+    expect(coerceNumericDisplay('-3.0')).toBe('-3');
+    expect(coerceNumericDisplay('2.5')).toBe('2.5'); // non-integral stays
+    expect(coerceNumericDisplay('v2.0')).toBe('v2.0'); // not a bare number
+  });
+
+  it('fixedPointNumberDisplay converts E-notation to fixed point', () => {
+    expect(fixedPointNumberDisplay('7.15E-4')).toBe('0.000715');
+    expect(fixedPointNumberDisplay('1e3')).toBe('1000');
+    expect(fixedPointNumberDisplay('0.031')).toBe('0.031'); // untouched
+    expect(fixedPointNumberDisplay('fast')).toBe('fast');
+  });
+
+  it('compact status displays coerced ("409.0" → 409) and full duration_s fixed-point', () => {
+    const row: ResultRow = {
+      map: {
+        _raw: JSON.stringify({
+          log: { levelname: 'INFO', message: 'req', method: 'GET', path: '/x', status: '409.0', duration_s: '7.15E-4' },
+        }),
+      },
+    };
+    const out = formatMessages([row], { detail: 'full', maxMessageChars: 10_000, format: 'text' });
+    expect(out).toContain('status=409');
+    expect(out).not.toContain('409.0');
+    expect(out).toContain('duration_s=0.000715');
+    expect(out).not.toContain('E-4');
+  });
+
+  it('fallbackDigestLevel: sev=/Fatal/type=/token fallbacks when the standard level is absent', () => {
+    const flat = (raw: string) => flattenMessage({ _raw: raw });
+    expect(fallbackDigestLevel(flat(JSON.stringify({ log: { severity: '4', message: 'x' } })))).toBe('sev=4');
+    expect(fallbackDigestLevel(flat(JSON.stringify({ log: { severity: '2.0', message: 'x' } })))).toBe('sev=2');
+    expect(fallbackDigestLevel(flat(JSON.stringify({ log: { severity: 'Fatal', message: 'x' } })))).toBe('Fatal');
+    expect(fallbackDigestLevel(flat(JSON.stringify({ log: { type: 'exception', message: 'x' } })))).toBe('type=exception');
+    expect(fallbackDigestLevel(flat('2026/07/04 [error] open() failed'))).toBe('[error]');
+    expect(fallbackDigestLevel(flat('plain line'))).toBe('UNKNOWN');
+    // The standard level always wins when present.
+    expect(fallbackDigestLevel(flat(JSON.stringify({ log: { levelname: 'ERROR', severity: '1', message: 'x' } })))).toBe('ERROR');
+  });
+});
+
+describe('renderDigest (§4.6, §11.4)', () => {
+  it('renders req=— when a group has no request id (explicit absence, not omission)', () => {
+    const groups = new Map<string, DigestGroup>();
+    accumulateDigest(groups, flattenMessage({ _messagetime: '1783017533330', _raw: JSON.stringify({ log: { levelname: 'ERROR', message: 'boom' } }) }), 1783017533330);
+    const out = renderDigest({ scanned: 1, topN: 5, truncated: false }, groups);
+    expect(out).toContain('req=—');
+  });
+
+  it('groups by the fallback level so numeric-family rows do not all collapse into UNKNOWN', () => {
+    const groups = new Map<string, DigestGroup>();
+    const mk = (raw: string) => flattenMessage({ _raw: raw });
+    accumulateDigest(groups, mk(JSON.stringify({ log: { severity: '4', message: 'same text' } })), 1);
+    accumulateDigest(groups, mk(JSON.stringify({ log: { type: 'exception', message: 'same text' } })), 2);
+    expect(groups.size).toBe(2); // sev=4 and type=exception are distinct groups
+    const out = renderDigest({ scanned: 2, topN: 5, truncated: false }, groups);
+    expect(out).toContain('sev=4');
+    expect(out).toContain('type=exception');
+  });
+});
+
+describe('renderFacets annotations (§10.3, §11.1)', () => {
+  const header = { query: 'scope', fromLabel: 'a', toLabel: 'b', byReceiptTime: false, limit: 15 };
+
+  it('annotates an all-(none) dimension with the describe_schema hint', () => {
+    const out = renderFacets(header, [
+      { dimension: 'levelname', rows: [{ key: '', count: 48_112 }] },
+    ]);
+    expect(out).toContain('(none)');
+    expect(out).toContain('may not exist at this path');
+    expect(out).toContain('sumo_describe_schema');
+  });
+
+  it('does NOT annotate a dimension with real values, and coerces float-string keys', () => {
+    const out = renderFacets(header, [
+      {
+        dimension: 'log.status',
+        rows: [
+          { key: '404.0', count: 10 },
+          { key: '', count: 2 },
+        ],
+      },
+    ]);
+    expect(out).toContain('10  404');
+    expect(out).not.toContain('404.0');
+    expect(out).not.toContain('may not exist');
+  });
+});
+
+describe('dedupe + detail:"raw" keeps one exemplar (§11.3)', () => {
+  it('each multi-row group renders its header line PLUS one verbatim _raw exemplar', () => {
+    const raw1 = JSON.stringify({ log: { levelname: 'ERROR', message: 'boom id=1', user_agent: 'curl/8' } });
+    const raw2 = JSON.stringify({ log: { levelname: 'ERROR', message: 'boom id=2', user_agent: 'curl/8' } });
+    const rows: ResultRow[] = [{ map: { _raw: raw1 } }, { map: { _raw: raw2 } }];
+    const out = formatMessages(rows, { detail: 'raw', dedupe: true, maxMessageChars: 10_000, format: 'text' });
+    expect(out).toContain('×2');
+    expect(out).toContain(raw1); // the payload survives the grouping
+    expect(out).toContain('user_agent');
+    expect(out).not.toContain(raw2); // ONE exemplar, not all
+  });
+
+  it('ndjson dedupe+raw carries the exemplar in _raw', () => {
+    const raw = JSON.stringify({ log: { levelname: 'ERROR', message: 'boom id=1' } });
+    const rows: ResultRow[] = [{ map: { _raw: raw } }, { map: { _raw: raw } }];
+    const out = formatMessages(rows, { detail: 'raw', dedupe: true, maxMessageChars: 10_000, format: 'ndjson' });
+    const obj = JSON.parse(out);
+    expect(obj.count).toBe(2);
+    expect(obj._raw).toBe(raw);
+  });
+});
+
+describe('summary provenance + loud sample labels (§6)', () => {
+  const status: SearchJobStatus = {
+    state: 'DONE GATHERING RESULTS',
+    messageCount: 500,
+    recordCount: 0,
+    pendingWarnings: [],
+    pendingErrors: [],
+  };
+
+  it('labels exact counts with the detected field provenance', () => {
+    const out = formatMessages([sampleRow], {
+      detail: 'summary', maxMessageChars: 10_000, format: 'text',
+      exactLevelCounts: { '3': 12, Fatal: 1 },
+      exactLevelProvenance: 'log.severity',
+    }, status);
+    expect(out).toContain('by log.severity (auto-detected; exact, whole job):');
+    expect(out).toContain('3: 12');
+  });
+
+  it('the sample fallback label is LOUD (never a quiet ambiguous sample)', () => {
+    const out = formatMessages([sampleRow, sampleRow], {
+      detail: 'summary', maxMessageChars: 10_000, format: 'text',
+    }, status);
+    expect(out).toContain('by level (SAMPLE — first 2 of 500 only; not whole-job):');
+  });
+});
+
 describe('renderTrend', () => {
   it('handles no rows', async () => {
     const { renderTrend } = await import('../src/format/renderTrend.js');
@@ -424,7 +574,7 @@ describe('renderTrend', () => {
     expect(out).toContain('[10 0]');
   });
 
-  it('renders empty-key series as (none)', async () => {
+  it('renders empty-key series as (none), annotating an ALL-(none) trend with the hint', async () => {
     const { renderTrend } = await import('../src/format/renderTrend.js');
     const out = renderTrend(
       { fromLabel: 'a', toLabel: 'b', intervalLabel: '1m', intervalMs: 60_000, by: 'levelname', maxSeries: 8 },
@@ -432,5 +582,17 @@ describe('renderTrend', () => {
     );
     expect(out).toContain('(none)');
     expect(out).toContain('buckets=1');
+    expect(out).toContain('may not exist at this path');
+    expect(out).toContain('sumo_describe_schema');
+  });
+
+  it('coerces float-string series keys for display', async () => {
+    const { renderTrend } = await import('../src/format/renderTrend.js');
+    const out = renderTrend(
+      { fromLabel: 'a', toLabel: 'b', intervalLabel: '1m', intervalMs: 60_000, by: 'log.severity', maxSeries: 8 },
+      [{ sliceMs: 0, key: '2.0', count: 4 }],
+    );
+    expect(out).toMatch(/^2 {2}/m);
+    expect(out).not.toContain('2.0');
   });
 });

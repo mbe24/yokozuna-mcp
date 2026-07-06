@@ -5,3 +5,4 @@ dist/
 # Not for publication (kept locally, excluded from the repo)
 plan/
 sumologic-api.yaml
+feedback/
